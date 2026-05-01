@@ -21,6 +21,7 @@ bld/
 [Bb]in/
 [Oo]bj/
 [Ll]ib/
+!3rdParty/zlib/lib/
 
 # Visual Studio 2015 cache/options directory
 .vs/
