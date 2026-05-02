@@ -1,4 +1,4 @@
-/*
+	/*
  * $Log: clicksaver.c,v $
  * Revision 1.16  2004/12/27 17:28:12  gnarf37
  * Added Option for multiple missions, quick change
@@ -135,6 +135,30 @@ DWORD WINAPI HookManagerThread( void *pParam );
 
 //DB* g_pDB = NULL;
 
+// Helper: Show a modal message box that appears on top of the topmost main window
+static int ShowModalMessage(HWND hParent, const char* text, const char* caption, UINT type)
+{
+    // If no parent given, use the main window
+    if (!hParent && g_MainWin)
+        hParent = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
+    
+    BOOL wasTopmost = FALSE;
+    if (hParent) {
+        LONG exStyle = GetWindowLong(hParent, GWL_EXSTYLE);
+        if (exStyle & WS_EX_TOPMOST) {
+            wasTopmost = TRUE;
+            SetWindowPos(hParent, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        }
+    }
+    
+    int result = MessageBox(hParent, text, caption, type | MB_SYSTEMMODAL);
+    
+    if (wasTopmost && hParent) {
+        SetWindowPos(hParent, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    }
+    return result;
+}
+
 // Forward declarations for item string helpers
 void BuildItemString(char *dest, size_t destSize,
                      const char *itemName,
@@ -239,7 +263,7 @@ INT_PTR CALLBACK ItemEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPar
     return FALSE;
 }
 
-INT_PTR CALLBACK MassAddDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+static INT_PTR CALLBACK MassAddDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
     {
@@ -257,7 +281,7 @@ INT_PTR CALLBACK MassAddDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
 				GetDlgItemTextA(hDlg, IDC_MASS_EDIT, text, sizeof(text));
 			
 				char *p = text;
-				char line[1024];
+                char line[1024] = { 0 };
 				int lineIdx;
 			
 				while (*p)
@@ -313,10 +337,10 @@ INT_PTR CALLBACK MassAddDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
 					}
 			
 					// Now parse: item name, then optional ';limit', then optional '^exclude' tokens
-					char itemName[256];
+					char itemName[256] = { 0 };
 					itemName[0] = '\0';
 					int limit = 1;          // default limit
-					char excludeWords[256];
+					char excludeWords[256] = { 0 };
 					excludeWords[0] = '\0';
 			
 					// ---- Collect item name: stop at ';' or '^' or end of string ----
@@ -361,7 +385,7 @@ INT_PTR CALLBACK MassAddDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
 							// Skip any spaces after caret (optional)
 							while (*ptr == ' ') ptr++;
 							// Collect the exclude word (until next space or end)
-							char word[128];
+							char word[128] = { 0 };
 							int wlen = 0;
 							while (*ptr && *ptr != ' ' && *ptr != '^')
 							{
@@ -437,7 +461,7 @@ int ShowItemEditDialog(HWND hParent, ItemEditData *pData, int bIsAddMode)
 // Forward declaration for the subclass procedure
 LRESULT CALLBACK MainWndProcHook( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData );
 
-LRESULT CALLBACK BAWndProcHook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+static LRESULT CALLBACK BAWndProcHook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
     if (uMsg == WM_MOVE || uMsg == WM_MOVING)
     {
@@ -449,6 +473,7 @@ LRESULT CALLBACK BAWndProcHook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 // ===============================================
+
 
 // ========== Helper functions for item string format ==========
 void BuildItemString(char *dest, size_t destSize,
@@ -607,7 +632,7 @@ void MakeTableEntry(char *dest, size_t destSize, const char *raw)
 
 // Parse a display string (e.g. "Staff [qty 3] [exclude: rotten]") back into fields
 // Returns 0 on success, -1 if parsing fails
-int ParseDisplayString(const char *display, char *itemName, size_t itemNameSize,
+static int ParseDisplayString(const char *display, char *itemName, size_t itemNameSize,
                        int *disabled, int *forceAccept, int *quantityLimit,
                        char *excludeWords, size_t excludeSize)
 {
@@ -678,12 +703,12 @@ int ParseDisplayString(const char *display, char *itemName, size_t itemNameSize,
 }
 
 // Move the currently selected item from active list to disabled list
-void MoveCurrentActiveToDisabled(void)
+static void MoveCurrentActiveToDisabled(void)
 {
     PUU32 listView = puGetObjectFromCollection(g_pCol, CS_ITEMWATCH_LISTVIEW);
     int selectedIndex = (int)puGetAttribute(listView, PUA_LISTVIEW_SELECTED);
     if (selectedIndex < 0) {
-        MessageBox(NULL, "No item selected.", "ClickSaver", MB_OK | MB_ICONINFORMATION);
+        ShowModalMessage(NULL, "No item selected.", "ClickSaver", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
@@ -692,7 +717,7 @@ void MoveCurrentActiveToDisabled(void)
     for (int i = 0; i < selectedIndex && record; i++)
         record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETNEXTRECORD, record, 0);
     if (!record) {
-        MessageBox(NULL, "No item selected or could not find the selected record.", "ClickSaver", MB_OK | MB_ICONWARNING);
+        ShowModalMessage(NULL, "No item selected or could not find the selected record.", "ClickSaver", MB_OK | MB_ICONWARNING);
         return;
     }
 
@@ -724,12 +749,12 @@ void MoveCurrentActiveToDisabled(void)
     puSetAttribute(listView, PUA_LISTVIEW_SELECTED, newIndex);
 }
 
-void MoveCurrentDisabledToActive(void)
+static void MoveCurrentDisabledToActive(void)
 {
     PUU32 listView = puGetObjectFromCollection(g_pCol, CS_DISABLED_ITEMWATCH_LISTVIEW);
     int selectedIndex = (int)puGetAttribute(listView, PUA_LISTVIEW_SELECTED);
     if (selectedIndex < 0) {
-        MessageBox(NULL, "No item selected in disabled list.", "ClickSaver", MB_OK | MB_ICONINFORMATION);
+        ShowModalMessage(NULL, "No item selected in disabled list.", "ClickSaver", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
@@ -738,7 +763,7 @@ void MoveCurrentDisabledToActive(void)
     for (int i = 0; i < selectedIndex && record; i++)
         record = puDoMethod(g_DisabledItemWatchList, PUM_TABLE_GETNEXTRECORD, record, 0);
     if (!record) {
-        MessageBox(NULL, "No item selected or could not find the selected disabled record.", "ClickSaver", MB_OK | MB_ICONWARNING);
+        ShowModalMessage(NULL, "No item selected or could not find the selected disabled record.", "ClickSaver", MB_OK | MB_ICONWARNING);
         return;
     }
 
@@ -764,6 +789,186 @@ void MoveCurrentDisabledToActive(void)
         newIndex = maxRows - 1;
     }
     puSetAttribute(listView, PUA_LISTVIEW_SELECTED, newIndex);
+}
+
+static void RemoveDuplicateItems(void) {
+    // We'll build a hash set of display strings, keeping first occurrence.
+    // Simple O(n^2) for small lists is fine; if list large, use temporary array.
+    PUU32 record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
+    PUU32 prevRecord = 0;
+    int removed = 0;
+
+    // We'll traverse and remove duplicates by comparing each record with all previous ones.
+    // Simpler: collect all display strings into an array, then rebuild table.
+    // But rebuilding might lose order and cause UI issues. Instead, two-pass.
+
+    // First pass: collect unique display strings
+    char **unique = NULL;
+    int uniqueCount = 0;
+    record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
+    while (record) {
+        PUU8 *display = (PUU8*)puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIELDVAL, record, 0);
+        if (display) {
+            int already = 0;
+            for (int i = 0; i < uniqueCount; i++) {
+                if (strcmp(unique[i], (char*)display) == 0) {
+                    already = 1;
+                    break;
+                }
+            }
+            if (!already) {
+                unique = realloc(unique, (uniqueCount + 1) * sizeof(char*));
+                unique[uniqueCount] = _strdup((char*)display);
+                uniqueCount++;
+            } else {
+                removed++;
+            }
+        }
+        record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETNEXTRECORD, record, 0);
+    }
+
+    if (removed == 0) {
+        free(unique);
+        ShowModalMessage(NULL, "No duplicate items found.", "Remove Duplicates", MB_OK);
+        return;
+    }
+
+    // Rebuild the table from unique list
+    // Clear table
+    record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
+    while (record) {
+        puDoMethod(g_ItemWatchList, PUM_TABLE_REMRECORD, record, 0);
+        record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
+    }
+    for (int i = 0; i < uniqueCount; i++) {
+        puDoMethod(g_ItemWatchList, PUM_TABLE_NEWRECORD, 0, 0);
+        puDoMethod(g_ItemWatchList, PUM_TABLE_ADDRECORD, 0, 0);
+        puDoMethod(g_ItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)unique[i], 0);
+        free(unique[i]);
+    }
+    free(unique);
+
+    // Refresh listview
+    PUU32 listView = puGetObjectFromCollection(g_pCol, CS_ITEMWATCH_LISTVIEW);
+    puSetAttribute(listView, PUA_LISTVIEW_SELECTED, -1);
+
+    char msg[64];
+    sprintf(msg, "Removed %d duplicate entries.", removed);
+    ShowModalMessage(NULL, msg, "Remove Duplicates", MB_OK);
+}
+
+static int ItemExistsInActiveList(const char *displayString) {
+    PUU32 record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
+    while (record) {
+        PUU8 *existing = (PUU8*)puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIELDVAL, record, 0);
+        if (existing && strcmp((char*)existing, displayString) == 0) {
+            return 1;
+        }
+        record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETNEXTRECORD, record, 0);
+    }
+    return 0;
+}
+
+static void ImportItemsFromFile(const char *filename, int replaceMode) {
+    if (replaceMode) {
+        // Confirm? Already handled in UI, but safe to double-check
+        if (ShowModalMessage(NULL, "Replace will delete all current items. Continue?", 
+                       "Confirm Replace", MB_YESNO) != IDYES)
+            return;
+        // Clear active watchlist
+        PUU32 record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
+        while (record) {
+            puDoMethod(g_ItemWatchList, PUM_TABLE_REMRECORD, record, 0);
+            record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
+        }
+        PUU32 listView = puGetObjectFromCollection(g_pCol, CS_ITEMWATCH_LISTVIEW);
+        puSetAttribute(listView, PUA_LISTVIEW_SELECTED, -1);
+    }
+
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        DisplayErrorMessage("Cannot open file.", TRUE);
+        return;
+    }
+
+    char line[1024];
+    int inItemSection = 0;
+    int addedCount = 0;
+    int duplicateCount = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        // Trim newline
+        line[strcspn(line, "\r\n")] = 0;
+
+        if (strcmp(line, "::ItemWatch::") == 0) {
+            inItemSection = 1;
+            continue;
+        }
+        if (strcmp(line, "::END::") == 0 || strncmp(line, "::", 2) == 0)
+            break;
+        if (!inItemSection) continue;
+
+        // Skip empty lines
+        if (strlen(line) == 0) continue;
+
+        // Convert raw line to display string
+        char display[1024];
+        MakeTableEntry(display, sizeof(display), line);
+
+        // Duplicate check (only for append mode; replace already cleared list)
+        if (!replaceMode && ItemExistsInActiveList(display)) {
+            duplicateCount++;
+            continue;
+        }
+
+        // Add item
+        puDoMethod(g_ItemWatchList, PUM_TABLE_NEWRECORD, 0, 0);
+        puDoMethod(g_ItemWatchList, PUM_TABLE_ADDRECORD, 0, 0);
+        puDoMethod(g_ItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)display, 0);
+        addedCount++;
+    }
+    fclose(fp);
+
+    char msg[256];
+    sprintf(msg, "Imported %d items. Duplicates skipped: %d", addedCount, duplicateCount);
+    ShowModalMessage(NULL, msg, "Import Complete", MB_OK);
+}
+
+static void ExportItemsOnly(const char *filename)
+{
+    char fullpath[MAX_PATH];
+    strcpy(fullpath, filename);
+    
+    // Append .cs if not already present (case-insensitive)
+    size_t len = strlen(fullpath);
+    if (len < 3 || _stricmp(fullpath + len - 3, ".cs") != 0)
+        strcat(fullpath, ".cs");
+    
+    FILE *fp = fopen(fullpath, "w");
+    if (!fp) {
+        char err[256];
+        sprintf(err, "Cannot create file:\n%s", fullpath);
+        DisplayErrorMessage(err, TRUE);
+        return;
+    }
+    
+    fprintf(fp, "::ItemWatch::\n");
+    PUU32 record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
+    while (record) {
+        PUU8 *display = (PUU8*)puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIELDVAL, record, 0);
+        if (display && *display) {
+            char itemName[256] = {0}, exclude[256] = {0};
+            int disabled = 0, force = 0, limit = 0;
+            ParseDisplayString((char*)display, itemName, sizeof(itemName),
+                               &disabled, &force, &limit, exclude, sizeof(exclude));
+            char raw[512];
+            BuildItemString(raw, sizeof(raw), itemName, disabled, force, limit, exclude);
+            fprintf(fp, "%s\n", raw);
+        }
+        record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETNEXTRECORD, record, 0);
+    }
+    fprintf(fp, "::END::\n");
+    fclose(fp);
 }
 
 // ========== ADDED FOR QUANTITY LIMITS ==========
@@ -795,7 +1000,7 @@ void AddItemCounter(const char *name, int limit) {
     g_ItemCounters = new;
 }
 
-void ClearItemCounters() {
+static void ClearItemCounters() {
     // Never clear counters while a buying session is active
     if (g_bBuyingAgentActive) {
         return;
@@ -932,7 +1137,7 @@ void* GetDataChunk(PUU32 _KeyHi, PUU32 _KeyLo, PUU32* _pSize)
 	return pReturnData;
 }
 
-int HasActiveWatchlistItems()
+static int HasActiveWatchlistItems()
 {
     PUU32 Record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
     while (Record)
@@ -1148,7 +1353,7 @@ int main( int argc, char** argv )
 				int selectedIndex = (int)puGetAttribute(listView, PUA_LISTVIEW_SELECTED);
 			
 				if (selectedIndex < 0) {
-					MessageBox(NULL, "No item selected.\n\nPlease click on an item first, then click Edit.", 
+					ShowModalMessage(NULL, "No item selected.\n\nPlease click on an item first, then click Edit.", 
 							"ClickSaver", MB_OK | MB_ICONINFORMATION);
 					break;
 				}
@@ -1159,7 +1364,7 @@ int main( int argc, char** argv )
 					recordKey = puDoMethod(g_ItemWatchList, PUM_TABLE_GETNEXTRECORD, recordKey, 0);
 			
 				if (!recordKey) {
-					MessageBox(NULL, "Could not locate selected item in table.", "ClickSaver", MB_OK | MB_ICONWARNING);
+					ShowModalMessage(NULL, "Could not locate selected item in table.", "ClickSaver", MB_OK | MB_ICONWARNING);
 					break;
 				}
 			
@@ -1206,7 +1411,7 @@ int main( int argc, char** argv )
 			}
 		case CSAM_REMOVE_ALL_ITEMS:
         {
-            if (MessageBox(NULL,
+            if (ShowModalMessage(NULL,
                 "Are you sure you want to remove ALL items from the active list?",
                 "Confirm Remove All", MB_YESNO | MB_ICONWARNING) == IDYES)
             {
@@ -1227,7 +1432,7 @@ int main( int argc, char** argv )
 
         case CSAM_REMOVE_ALL_DISABLED:
         {
-            if (MessageBox(NULL,
+            if (ShowModalMessage(NULL,
                 "Are you sure you want to remove ALL items from the disabled list?",
                 "Confirm Remove All", MB_YESNO | MB_ICONWARNING) == IDYES)
             {
@@ -1265,7 +1470,39 @@ int main( int argc, char** argv )
 				}
 				break;
 			}
-			
+		
+		case CSAM_IMPORT_ITEMS:
+			{
+				char filename[MAX_PATH];
+				HWND hMainWnd = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
+				if (GetFile(hMainWnd, FALSE, filename, sizeof(filename)))
+				{
+					int choice = ShowModalMessage(hMainWnd,
+						"Import Items:\n\nYes = Append to current list\nNo = Replace current list\nCancel = Cancel",
+						"Import Items", MB_YESNOCANCEL | MB_ICONQUESTION);
+					if (choice == IDYES)
+						ImportItemsFromFile(filename, 0);
+					else if (choice == IDNO)
+						ImportItemsFromFile(filename, 1);
+				}
+				break;
+			}
+		case CSAM_REMOVE_DUPLICATE_ITEMS:
+				RemoveDuplicateItems();
+				break;
+		case CSAM_EXPORT_ITEMS:
+			{
+				char filename[MAX_PATH];
+				HWND hMainWnd = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
+				if (GetFile(hMainWnd, TRUE, filename, sizeof(filename)))
+				{
+					ExportItemsOnly(filename);
+					char msg[256];
+					sprintf(msg, "Exported %d items.", puGetAttribute(g_ItemWatchList, PUA_TABLE_NUMRECORDS));
+					ShowModalMessage(hMainWnd, msg, "Export Complete", MB_OK);
+				}
+				break;
+			}
 		case CSAM_UPDATE_DELAY:
 			{
 				PULID delayCtrl = puGetObjectFromCollection( g_pCol, CS_BUYINGAGENTDELAY_ENTRY );
@@ -2346,6 +2583,7 @@ BOOL GetFile( HWND hWndOwner, BOOL saving, char* buffer, int buffersize )
     ofn.lStructSize = sizeof( OPENFILENAME );
     ofn.Flags = saving ? OFN_HIDEREADONLY : ( OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY );
     ofn.lpstrFilter = "Clicksaver Files\0*.CS\0";
+	if (saving) ofn.lpstrDefExt = "cs";
     ofn.lpstrFile = buffer;
     ofn.lpstrFile[ 0 ] = '\0';
     ofn.nMaxFile = buffersize;
@@ -2526,7 +2764,7 @@ void WriteDebug( const char* txt )
 #endif
 }
 
-void _dragMouse( int x0, int y0, int x1, int y1 )
+static void _dragMouse( int x0, int y0, int x1, int y1 )
 {
     POINT MousePos = {0, 0};
     LPARAM lParam;
@@ -2557,7 +2795,7 @@ void _dragMouse( int x0, int y0, int x1, int y1 )
     Sleep( 250 );
 }
 
-float _linIinterp( float lo, float hi, float ratio )
+static float _linIinterp( float lo, float hi, float ratio )
 {
     return ( hi - lo ) * ratio + lo;
 }
