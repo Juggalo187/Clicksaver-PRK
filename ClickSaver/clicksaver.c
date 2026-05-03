@@ -70,7 +70,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <shlobj.h>
 #include <stdio.h>
 #include <string.h>
-#include <commctrl.h>   // for SetWindowSubclass
+#include <commctrl.h>
+#include <windowsx.h>
 #include "clicksaver.h"
 #include "resource.h"
 
@@ -84,6 +85,11 @@ sqlite3*      g_pSQLite = NULL;
 sqlite3_stmt* g_stmtItem = NULL;
 sqlite3_stmt* g_stmtIcon = NULL;
 sqlite3_stmt* g_stmtPF = NULL;
+
+// Forward declarations for item name cache
+void BuildItemNameCache(const char *filename);
+int LoadItemNameCache(const char *cacheFilePath);
+void FreeItemNameCache(void);
 
 void CleanUp();
 void ImportSettings( char* filename );
@@ -186,11 +192,102 @@ static int g_PendingAttemptNumber = 0;
 typedef struct {
     char itemName[256];
     int  limit;
-    int  disabled;   // kept for compatibility, not used
+    int  disabled;
     int  force;
     char exclude[256];
-    int  isAdd;      // 1 = adding new item, 0 = editing existing
+    int  isAdd;
 } ItemEditData;
+
+// Structure to pass data to the match list dialog
+typedef struct {
+    const char **matches;
+    int count;
+    char selected[256];
+    char originalSearch[256];
+    char excludeWords[256];
+} MatchListData;
+
+static INT_PTR CALLBACK MatchListDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    MatchListData *pData = (MatchListData*)GetWindowLongPtr(hDlg, DWLP_USER);
+
+    switch (msg)
+    {
+    case WM_INITDIALOG:
+    {
+        pData = (MatchListData*)lParam;
+        SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)pData);
+
+        HWND hList = GetDlgItem(hDlg, IDC_MATCH_LIST);
+        for (int i = 0; i < pData->count; i++) {
+            SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)pData->matches[i]);
+        }
+
+        // Build hint text
+        char hint[512];
+        if (pData->excludeWords[0] != '\0') {
+            sprintf(hint, "Hint: You can Double click an item in the lsit to select it.\n\nHint: Using the original search term \"%s\" with exclusions (%s) will match %d item(s).",
+                    pData->originalSearch, pData->excludeWords, pData->count);
+        } else {
+            sprintf(hint, "Hint: You can Double click an item in the lsit to select it.\n\nHint: Using the original search term \"%s\" will match %d item(s).",
+                    pData->originalSearch, pData->count);
+        }
+        SetDlgItemTextA(hDlg, IDC_MATCH_HINT, hint);
+
+        SetFocus(GetDlgItem(hDlg, IDC_MATCH_EDIT));
+        return FALSE;
+    }
+
+    case WM_COMMAND:
+    {
+        if (LOWORD(wParam) == IDC_USE_ORIGINAL) {
+            pData->selected[0] = '\0';
+            EndDialog(hDlg, IDC_USE_ORIGINAL);
+            return TRUE;
+        }
+
+        if (LOWORD(wParam) == IDC_USE_TYPED) {
+            char typed[256];
+            GetDlgItemTextA(hDlg, IDC_MATCH_EDIT, typed, sizeof(typed));
+            if (strlen(typed) == 0) {
+                MessageBox(hDlg, "Please enter a name or click Cancel.", "Empty Name", MB_OK | MB_ICONWARNING);
+                return TRUE;
+            }
+
+            // Check how many items this typed name would match (using same exclude words)
+            int newMatchCount = 0;
+            const char **newMatches = NULL;
+            GetFilteredMatchingItems(typed, pData->excludeWords, &newMatches, &newMatchCount);
+            free((void*)newMatches);
+
+            char msg[512];
+            sprintf(msg, "Your typed name \"%s\" would match %d item(s).\n\nUse this name?", typed, newMatchCount);
+            if (MessageBox(hDlg, msg, "Confirm Typed Name", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                strcpy(pData->selected, typed);
+                EndDialog(hDlg, IDOK);
+            }
+            return TRUE;
+        }
+
+        if (LOWORD(wParam) == IDCANCEL) {
+            EndDialog(hDlg, IDCANCEL);
+            return TRUE;
+        }
+
+        if (LOWORD(wParam) == IDC_MATCH_LIST && HIWORD(wParam) == LBN_DBLCLK) {
+            HWND hList = GetDlgItem(hDlg, IDC_MATCH_LIST);
+            int sel = SendMessage(hList, LB_GETCURSEL, 0, 0);
+            if (sel != LB_ERR) {
+                SendMessageA(hList, LB_GETTEXT, sel, (LPARAM)pData->selected);
+                EndDialog(hDlg, IDOK);
+            }
+            return TRUE;
+        }
+        break;
+    }
+    }
+    return FALSE;
+}
 
 // Forward declarations
 INT_PTR CALLBACK ItemEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -205,60 +302,127 @@ INT_PTR CALLBACK ItemEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPar
     switch (msg)
     {
     case WM_INITDIALOG:
-		{
-			pData = (ItemEditData*)lParam;
-			SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)pData);
-		
-			// Set the dialog title
-			if (pData->isAdd)
-				SetWindowTextA(hDlg, "Add Item");
-			else
-				SetWindowTextA(hDlg, "Edit Item");
-		
-			SetDlgItemTextA(hDlg, IDC_ITEM_NAME, pData->itemName);
-			SetDlgItemInt(hDlg, IDC_LIMIT, pData->limit, FALSE);
-			CheckDlgButton(hDlg, IDC_FORCE, pData->force ? BST_CHECKED : BST_UNCHECKED);
-			SetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude);
-		
-			hBrush = CreateSolidBrush(RGB(240, 240, 240));
-			return TRUE;
-		}
+    {
+        pData = (ItemEditData*)lParam;
+        SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)pData);
+
+        // Set the dialog title
+        if (pData->isAdd)
+            SetWindowTextA(hDlg, "Add Item");
+        else
+            SetWindowTextA(hDlg, "Edit Item");
+
+        SetDlgItemTextA(hDlg, IDC_ITEM_NAME, pData->itemName);
+        SetDlgItemInt(hDlg, IDC_LIMIT, pData->limit, FALSE);
+        CheckDlgButton(hDlg, IDC_FORCE, pData->force ? BST_CHECKED : BST_UNCHECKED);
+        SetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude);
+
+        hBrush = CreateSolidBrush(RGB(240, 240, 240));
+        return TRUE;
+    }
 
     case WM_CTLCOLORDLG:
     case WM_CTLCOLORSTATIC:
         if (hBrush)
         {
-            // Make text background transparent – uses our brush for the fill
             SetBkMode((HDC)wParam, TRANSPARENT);
-            // (Optional) Set text color to black or dark grey
             SetTextColor((HDC)wParam, RGB(0, 0, 0));
             return (INT_PTR)hBrush;
         }
         break;
 
     case WM_DESTROY:
-        if (hBrush) {
-            DeleteObject(hBrush);
-            hBrush = NULL;
-        }
-        break;
+			if (hBrush) DeleteObject(hBrush);
+		break;
 
     case WM_COMMAND:
-        switch (LOWORD(wParam))
+    {
+        WORD wID = LOWORD(wParam);
+        WORD wNotify = HIWORD(wParam);
+        HWND hCtrl = (HWND)lParam;
+
+        switch (wID)
         {
         case IDOK:
-            GetDlgItemTextA(hDlg, IDC_ITEM_NAME, pData->itemName, sizeof(pData->itemName));
-            pData->limit = GetDlgItemInt(hDlg, IDC_LIMIT, NULL, FALSE);
-            pData->force = (IsDlgButtonChecked(hDlg, IDC_FORCE) == BST_CHECKED);
-            GetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude, sizeof(pData->exclude));
-            EndDialog(hDlg, IDOK);
-            return TRUE;
+			{
+				char enteredName[256];
+				GetDlgItemTextA(hDlg, IDC_ITEM_NAME, enteredName, sizeof(enteredName));
+			
+				// Trim leading/trailing spaces
+				char *start = enteredName;
+				while (*start == ' ') start++;
+				char *end = start + strlen(start) - 1;
+				while (end > start && *end == ' ') end--;
+				*(end + 1) = '\0';
+			
+				if (strlen(start) == 0) {
+					MessageBox(hDlg, "Item name cannot be empty.", "Validation", MB_OK | MB_ICONWARNING);
+					return TRUE;
+				}
+			
+				// Get exclude words from the dialog
+				char excludeTemp[256];
+				GetDlgItemTextA(hDlg, IDC_EXCLUDE, excludeTemp, sizeof(excludeTemp));
+			
+				// Get filtered list of matching items (respects exclusions)
+				int matchCount = 0;
+				const char **matches = NULL;
+				GetFilteredMatchingItems(start, excludeTemp, &matches, &matchCount);
+			
+				if (matchCount > 0) {
+					char msg[256];
+					sprintf(msg, "That would match %d item(s).\n\nBefore we add/update it, would you like to see a list of those possible matches?", matchCount);
+					int answer = MessageBox(hDlg, msg, "Multiple Matches", MB_YESNO | MB_ICONQUESTION);
+			
+					if (answer == IDYES) {
+						MatchListData data;
+						data.matches = matches;
+						data.count = matchCount;
+						data.selected[0] = '\0';
+						strcpy(data.originalSearch, start);
+						strcpy(data.excludeWords, excludeTemp);
+			
+						INT_PTR result = DialogBoxParam(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_MATCH_LIST),
+														hDlg, MatchListDlgProc, (LPARAM)&data);
+						if (result == IDOK && data.selected[0] != '\0') {
+							// User double‑clicked an item – replace the name
+							strcpy(start, data.selected);
+							SetDlgItemTextA(hDlg, IDC_ITEM_NAME, start);
+						} else if (result == IDC_USE_ORIGINAL) {
+							// User wants to keep the original name
+						} else {
+							// User cancelled
+							free((void*)matches);
+							return TRUE;
+						}
+					}
+					free((void*)matches);
+				} else {
+					// No matches – existing warning
+					char msg[512];
+					sprintf(msg, "Item \"%s\" would not match any known item.\n\nAdd it anyway?", start);
+					if (MessageBox(hDlg, msg, "Unknown Item", MB_YESNO | MB_ICONQUESTION) != IDYES)
+						return TRUE;
+				}
+			
+				// Copy trimmed name back
+				strcpy(pData->itemName, start);
+			
+				// Read other fields
+				pData->limit = GetDlgItemInt(hDlg, IDC_LIMIT, NULL, FALSE);
+				pData->force = (IsDlgButtonChecked(hDlg, IDC_FORCE) == BST_CHECKED);
+				GetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude, sizeof(pData->exclude));
+			
+				EndDialog(hDlg, IDOK);
+				return TRUE;
+			}
 
         case IDCANCEL:
             EndDialog(hDlg, IDCANCEL);
             return TRUE;
         }
         break;
+    }
     }
     return FALSE;
 }
@@ -1319,6 +1483,16 @@ int main( int argc, char** argv )
         CleanUp();
         return -1;
     }
+	
+char cachePath[MAX_PATH];
+sprintf(cachePath, "%s\\ItemNames.db", g_CSDir);
+if (!LoadItemNameCache(cachePath)) {
+    //MessageBox(NULL, "Building item name cache (one-time operation).\nPlease wait...", "ClickSaver", MB_OK);
+    BuildItemNameCache(cachePath);
+    if (!LoadItemNameCache(cachePath)) {
+        //MessageBox(NULL, "Warning: Could not build or load item name cache.\nShort item names will not be filtered.", "ClickSaver", MB_OK);
+    }
+}
 
     MissionControls[ 0 ] = puGetObjectFromCollection( g_pCol, CS_MISSION1 );
     MissionControls[ 1 ] = puGetObjectFromCollection( g_pCol, CS_MISSION2 );
@@ -1364,7 +1538,7 @@ int main( int argc, char** argv )
 					recordKey = puDoMethod(g_ItemWatchList, PUM_TABLE_GETNEXTRECORD, recordKey, 0);
 			
 				if (!recordKey) {
-					ShowModalMessage(NULL, "Could not locate selected item in table.", "ClickSaver", MB_OK | MB_ICONWARNING);
+					ShowModalMessage(NULL, "Could not locate selected item in table.\n\nAre you sure you clicked on an item?", "ClickSaver", MB_OK | MB_ICONWARNING);
 					break;
 				}
 			
@@ -2050,6 +2224,7 @@ void CleanUp()
 
     puDeleteObjectCollection( g_pCol );
     puClear();
+	FreeItemNameCache();
 }
 
 

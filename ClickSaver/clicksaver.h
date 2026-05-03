@@ -6,7 +6,7 @@
 #ifndef __CLICKSAVER_H__
 #define __CLICKSAVER_H__
 
-#define CS_VERSION "1.1"
+#define CS_VERSION "1.2"
 
 #include <windows.h>
 #include "mission.h"
@@ -168,6 +168,9 @@ extern PULID g_MainWin;
 extern PUU8 g_MishNumber, g_FoundMish;
 extern PUU8 g_bFullscreen;
 extern PUU32 g_GUIDef[];
+int IsWatchlistEntryValid(const char *searchStr);
+int GetMatchingItems(const char *searchStr, const char ***outItems, int *outCount);
+int GetFilteredMatchingItems(const char *baseName, const char *excludeWords, const char ***outItems, int *outCount);
 
 // Endianness macros
 #define EndianSwap16(x) ( ( x ) >> 8 | ( x ) << 8 )
