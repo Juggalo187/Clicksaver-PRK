@@ -74,11 +74,17 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <windowsx.h>
 #include "clicksaver.h"
 #include "resource.h"
+#include <ctype.h>
+#include <shellapi.h>   
+#include <uxtheme.h>
+#pragma comment(lib, "uxtheme.lib")
 
 //#include "BerkeleyDB/db.h"
 #include "sqlite3.h"
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "comctl32.lib")
+
+#define MATCH_AUTO_THRESHOLD 5
 
 // SQLite Globals
 sqlite3*      g_pSQLite = NULL;
@@ -127,7 +133,8 @@ PUU8 g_bForceUIRefresh = 0;
 PUU8 g_bPaused = 0;
 int g_BAWindowX = 300;
 int g_BAWindowY = 100;
-
+void EditActiveItem(void);
+void EditDisabledItem(void);
 char g_CurrentPacket[ 65536 ];
 
 char g_AODir[ MAX_PATH ] = { 0 };
@@ -207,79 +214,177 @@ typedef struct {
     char excludeWords[256];
 } MatchListData;
 
+static void UrlEncode(const char *src, char *dst, size_t dstSize)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t i = 0;
+    while (*src && i + 3 < dstSize)
+    {
+        if (isalnum((unsigned char)*src) || *src == '-' || *src == '_' || *src == '.' || *src == '~')
+            dst[i++] = *src;
+        else if (*src == ' ')
+            dst[i++] = '+';
+        else
+        {
+            dst[i++] = '%';
+            dst[i++] = hex[(*src >> 4) & 0x0F];
+            dst[i++] = hex[*src & 0x0F];
+        }
+        src++;
+    }
+    dst[i] = '\0';
+}
+
 static INT_PTR CALLBACK MatchListDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    MatchListData *pData = (MatchListData*)GetWindowLongPtr(hDlg, DWLP_USER);
+    // Use a unique name to avoid conflict with global pData
+    MatchListData *pMatchData = (MatchListData*)GetWindowLongPtr(hDlg, DWLP_USER);
+    static HBRUSH hBrush = NULL;
 
     switch (msg)
     {
     case WM_INITDIALOG:
     {
-        pData = (MatchListData*)lParam;
-        SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)pData);
+        pMatchData = (MatchListData*)lParam;
+        SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)pMatchData);
 
         HWND hList = GetDlgItem(hDlg, IDC_MATCH_LIST);
-        for (int i = 0; i < pData->count; i++) {
-            SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)pData->matches[i]);
+        for (int i = 0; i < pMatchData->count; i++) {
+            SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)pMatchData->matches[i]);
         }
 
-        // Build hint text
         char hint[512];
-        if (pData->excludeWords[0] != '\0') {
-            sprintf(hint, "Hint: You can Double click an item in the lsit to select it.\n\nHint: Using the original search term \"%s\" with exclusions (%s) will match %d item(s).",
-                    pData->originalSearch, pData->excludeWords, pData->count);
+        if (pMatchData->excludeWords[0] != '\0') {
+            sprintf(hint, "Hint: Double-click an item to select it.\n\nUsing original term \"%s\" with exclusions (%s) matches %d item(s).",
+                    pMatchData->originalSearch, pMatchData->excludeWords, pMatchData->count);
         } else {
-            sprintf(hint, "Hint: You can Double click an item in the lsit to select it.\n\nHint: Using the original search term \"%s\" will match %d item(s).",
-                    pData->originalSearch, pData->count);
+            sprintf(hint, "Hint: Double-click an item to select it.\n\nUsing original term \"%s\" matches %d item(s).",
+                    pMatchData->originalSearch, pMatchData->count);
         }
         SetDlgItemTextA(hDlg, IDC_MATCH_HINT, hint);
 
         SetFocus(GetDlgItem(hDlg, IDC_MATCH_EDIT));
+
+        hBrush = CreateSolidBrush(RGB(170, 170, 170));
         return FALSE;
     }
 
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORSTATIC:
+        if (hBrush) {
+            SetBkMode((HDC)wParam, TRANSPARENT);
+            SetTextColor((HDC)wParam, RGB(0, 0, 0));
+            return (INT_PTR)hBrush;
+        }
+        break;
+
+    case WM_DRAWITEM:
+    {
+        LPDRAWITEMSTRUCT lpDIS = (LPDRAWITEMSTRUCT)lParam;
+        if (lpDIS->hwndItem == GetDlgItem(hDlg, IDC_USE_ORIGINAL) ||
+            lpDIS->hwndItem == GetDlgItem(hDlg, IDC_USE_TYPED) ||
+            lpDIS->hwndItem == GetDlgItem(hDlg, IDC_LOOKUP_AUNO) ||
+            lpDIS->hwndItem == GetDlgItem(hDlg, IDCANCEL))
+        {
+            HBRUSH hBrushBg = CreateSolidBrush(RGB(112, 143, 166));
+            FillRect(lpDIS->hDC, &lpDIS->rcItem, hBrushBg);
+            DeleteObject(hBrushBg);
+
+            char text[256];
+            GetWindowTextA(lpDIS->hwndItem, text, sizeof(text));
+            SetBkMode(lpDIS->hDC, TRANSPARENT);
+            SetTextColor(lpDIS->hDC, RGB(0, 0, 0));
+            DrawTextA(lpDIS->hDC, text, -1, &lpDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            if (lpDIS->itemState & ODS_SELECTED)
+                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_SUNKEN, BF_RECT);
+            else
+                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_RAISED, BF_RECT);
+
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_DESTROY:
+        if (hBrush) DeleteObject(hBrush);
+        break;
+
     case WM_COMMAND:
     {
-        if (LOWORD(wParam) == IDC_USE_ORIGINAL) {
-            pData->selected[0] = '\0';
+        WORD wID = LOWORD(wParam);
+        if (wID == IDC_USE_ORIGINAL) {
+            pMatchData->selected[0] = '\0';
             EndDialog(hDlg, IDC_USE_ORIGINAL);
             return TRUE;
         }
-
-        if (LOWORD(wParam) == IDC_USE_TYPED) {
+        else if (wID == IDC_USE_TYPED) {
             char typed[256];
             GetDlgItemTextA(hDlg, IDC_MATCH_EDIT, typed, sizeof(typed));
             if (strlen(typed) == 0) {
-                MessageBox(hDlg, "Please enter a name or click Cancel.", "Empty Name", MB_OK | MB_ICONWARNING);
+                MessageBoxA(hDlg, "Please enter a name or click Cancel.", "Empty Name", MB_OK | MB_ICONWARNING);
                 return TRUE;
             }
 
-            // Check how many items this typed name would match (using same exclude words)
             int newMatchCount = 0;
             const char **newMatches = NULL;
-            GetFilteredMatchingItems(typed, pData->excludeWords, &newMatches, &newMatchCount);
+            GetFilteredMatchingItems(typed, pMatchData->excludeWords, &newMatches, &newMatchCount);
             free((void*)newMatches);
 
             char msg[512];
             sprintf(msg, "Your typed name \"%s\" would match %d item(s).\n\nUse this name?", typed, newMatchCount);
-            if (MessageBox(hDlg, msg, "Confirm Typed Name", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                strcpy(pData->selected, typed);
+            if (MessageBoxA(hDlg, msg, "Confirm Typed Name", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                strcpy(pMatchData->selected, typed);
                 EndDialog(hDlg, IDOK);
             }
             return TRUE;
         }
-
-        if (LOWORD(wParam) == IDCANCEL) {
+        else if (wID == IDCANCEL) {
             EndDialog(hDlg, IDCANCEL);
             return TRUE;
         }
-
-        if (LOWORD(wParam) == IDC_MATCH_LIST && HIWORD(wParam) == LBN_DBLCLK) {
+        else if (wID == IDC_MATCH_LIST && HIWORD(wParam) == LBN_DBLCLK) {
             HWND hList = GetDlgItem(hDlg, IDC_MATCH_LIST);
-            int sel = SendMessage(hList, LB_GETCURSEL, 0, 0);
+            int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
             if (sel != LB_ERR) {
-                SendMessageA(hList, LB_GETTEXT, sel, (LPARAM)pData->selected);
+                SendMessageA(hList, LB_GETTEXT, sel, (LPARAM)pMatchData->selected);
                 EndDialog(hDlg, IDOK);
+            }
+            return TRUE;
+        }
+        else if (wID == IDC_LOOKUP_AUNO) {
+            char searchTerm[256] = {0};
+            HWND hList = GetDlgItem(hDlg, IDC_MATCH_LIST);
+            int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+            if (sel != LB_ERR) {
+                SendMessageA(hList, LB_GETTEXT, sel, (LPARAM)searchTerm);
+            } else {
+                GetDlgItemTextA(hDlg, IDC_MATCH_EDIT, searchTerm, sizeof(searchTerm));
+            }
+
+            if (searchTerm[0] == '\0') {
+                MessageBoxA(hDlg, "No item selected or typed.", "Lookup", MB_OK | MB_ICONINFORMATION);
+                return TRUE;
+            }
+			
+			// Minimize ClickSaver main window
+			if (g_MainWin) {
+				HWND hMain = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
+				if (hMain && IsWindow(hMain)) {
+					ShowWindow(hMain, SW_MINIMIZE);
+				}
+			}
+
+            char encoded[512];
+            UrlEncode(searchTerm, encoded, sizeof(encoded));
+            char url[1024];
+            sprintf(url, "https://auno.org/ao/db.php?cmd=search&name=%s", encoded);
+
+            HINSTANCE result = ShellExecuteA(hDlg, "open", url, NULL, NULL, SW_SHOWNORMAL);
+            if ((int)result <= 32) {
+                char errMsg[256];
+                sprintf(errMsg, "Failed to open browser for:\n%s", url);
+                MessageBoxA(hDlg, errMsg, "Lookup Error", MB_OK | MB_ICONERROR);
             }
             return TRUE;
         }
@@ -306,7 +411,6 @@ INT_PTR CALLBACK ItemEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPar
         pData = (ItemEditData*)lParam;
         SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)pData);
 
-        // Set the dialog title
         if (pData->isAdd)
             SetWindowTextA(hDlg, "Add Item");
         else
@@ -317,7 +421,7 @@ INT_PTR CALLBACK ItemEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPar
         CheckDlgButton(hDlg, IDC_FORCE, pData->force ? BST_CHECKED : BST_UNCHECKED);
         SetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude);
 
-        hBrush = CreateSolidBrush(RGB(240, 240, 240));
+        hBrush = CreateSolidBrush(RGB(170, 170, 170));
         return TRUE;
     }
 
@@ -331,84 +435,142 @@ INT_PTR CALLBACK ItemEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPar
         }
         break;
 
+    case WM_DRAWITEM:
+    {
+        LPDRAWITEMSTRUCT lpDIS = (LPDRAWITEMSTRUCT)lParam;
+        if (lpDIS->hwndItem == GetDlgItem(hDlg, IDOK) ||
+            lpDIS->hwndItem == GetDlgItem(hDlg, IDCANCEL))
+        {
+            HBRUSH hBrushBg = CreateSolidBrush(RGB(112, 143, 166));
+            FillRect(lpDIS->hDC, &lpDIS->rcItem, hBrushBg);
+            DeleteObject(hBrushBg);
+
+            char text[256];
+            GetWindowTextA(lpDIS->hwndItem, text, sizeof(text));
+            SetBkMode(lpDIS->hDC, TRANSPARENT);
+            SetTextColor(lpDIS->hDC, RGB(0, 0, 0));
+            DrawTextA(lpDIS->hDC, text, -1, &lpDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            if (lpDIS->itemState & ODS_SELECTED)
+                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_SUNKEN, BF_RECT);
+            else
+                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_RAISED, BF_RECT);
+            return TRUE;
+        }
+        break;
+    }
+
     case WM_DESTROY:
-			if (hBrush) DeleteObject(hBrush);
-		break;
+        if (hBrush) DeleteObject(hBrush);
+        break;
 
     case WM_COMMAND:
-    {
-        WORD wID = LOWORD(wParam);
-        WORD wNotify = HIWORD(wParam);
-        HWND hCtrl = (HWND)lParam;
-
-        switch (wID)
+        switch (LOWORD(wParam))
         {
         case IDOK:
 			{
 				char enteredName[256];
 				GetDlgItemTextA(hDlg, IDC_ITEM_NAME, enteredName, sizeof(enteredName));
 			
-				// Trim leading/trailing spaces
+				// Trim spaces
 				char *start = enteredName;
 				while (*start == ' ') start++;
 				char *end = start + strlen(start) - 1;
 				while (end > start && *end == ' ') end--;
 				*(end + 1) = '\0';
-			
 				if (strlen(start) == 0) {
-					MessageBox(hDlg, "Item name cannot be empty.", "Validation", MB_OK | MB_ICONWARNING);
+					MessageBoxA(hDlg, "Item name cannot be empty.", "Validation", MB_OK | MB_ICONWARNING);
 					return TRUE;
 				}
 			
-				// Get exclude words from the dialog
+				// Get exclude words
 				char excludeTemp[256];
 				GetDlgItemTextA(hDlg, IDC_EXCLUDE, excludeTemp, sizeof(excludeTemp));
 			
-				// Get filtered list of matching items (respects exclusions)
-				int matchCount = 0;
-				const char **matches = NULL;
-				GetFilteredMatchingItems(start, excludeTemp, &matches, &matchCount);
-			
-				if (matchCount > 0) {
-					char msg[256];
-					sprintf(msg, "That would match %d item(s).\n\nBefore we add/update it, would you like to see a list of those possible matches?", matchCount);
-					int answer = MessageBox(hDlg, msg, "Multiple Matches", MB_YESNO | MB_ICONQUESTION);
-			
-					if (answer == IDYES) {
-						MatchListData data;
-						data.matches = matches;
-						data.count = matchCount;
-						data.selected[0] = '\0';
-						strcpy(data.originalSearch, start);
-						strcpy(data.excludeWords, excludeTemp);
-			
-						INT_PTR result = DialogBoxParam(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_MATCH_LIST),
-														hDlg, MatchListDlgProc, (LPARAM)&data);
-						if (result == IDOK && data.selected[0] != '\0') {
-							// User double‑clicked an item – replace the name
-							strcpy(start, data.selected);
-							SetDlgItemTextA(hDlg, IDC_ITEM_NAME, start);
-						} else if (result == IDC_USE_ORIGINAL) {
-							// User wants to keep the original name
-						} else {
-							// User cancelled
-							free((void*)matches);
-							return TRUE;
+				// If editing an existing item and the name hasn't changed, skip validation
+				if (!pData->isAdd && strcmp(start, pData->itemName) == 0) {
+					// Name unchanged – just keep existing quantity/force/exclude
+					// (No need to validate, just save as is)
+					strcpy(pData->itemName, start);
+					pData->limit = GetDlgItemInt(hDlg, IDC_LIMIT, NULL, FALSE);
+					pData->force = (IsDlgButtonChecked(hDlg, IDC_FORCE) == BST_CHECKED);
+					GetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude, sizeof(pData->exclude));
+					EndDialog(hDlg, IDOK);
+					return TRUE;
+				}
+				
+				char normalized[256];
+				strcpy(normalized, start);
+				for (char *p = normalized; *p; p++) {
+					if (*p == '-') {
+						if ((p == normalized || *(p-1) == ' ') && (*(p+1) == ' ' || *(p+1) == '\0')) {
+							*p = ' ';
 						}
 					}
-					free((void*)matches);
-				} else {
-					// No matches – existing warning
-					char msg[512];
-					sprintf(msg, "Item \"%s\" would not match any known item.\n\nAdd it anyway?", start);
-					if (MessageBox(hDlg, msg, "Unknown Item", MB_YESNO | MB_ICONQUESTION) != IDYES)
-						return TRUE;
 				}
+				// Collapse multiple spaces into one
+				char *dst = normalized;
+				int space = 0;
+				for (char *src = normalized; *src; src++) {
+					if (*src == ' ') {
+						if (!space) *dst++ = ' ';
+						space = 1;
+					} else {
+						*dst++ = *src;
+						space = 0;
+					}
+				}
+				*dst = '\0';
 			
-				// Copy trimmed name back
+				int matchCount = 0;
+				const char **matches = NULL;
+				GetFilteredMatchingItems(normalized, excludeTemp, &matches, &matchCount);
+			
+				if (matchCount == 0) {
+					char msg[512];
+					sprintf(msg, "Item \"%s\" does not match any known item.\n\nAdd it anyway?", start);
+					if (MessageBoxA(hDlg, msg, "Unknown Item", MB_YESNO | MB_ICONQUESTION) != IDYES) {
+						free((void*)matches);
+						return TRUE;
+					}
+				}
+				else if (matchCount <= MATCH_AUTO_THRESHOLD) {
+					// Silent accept – use typed name as is
+				}
+				else {
+					// Save current limit, force, exclude before showing match list
+					int savedLimit = GetDlgItemInt(hDlg, IDC_LIMIT, NULL, FALSE);
+					BOOL savedForce = IsDlgButtonChecked(hDlg, IDC_FORCE);
+					char savedExclude[256];
+					GetDlgItemTextA(hDlg, IDC_EXCLUDE, savedExclude, sizeof(savedExclude));
+			
+					// Automatically show match list
+					MatchListData data;
+					data.matches = matches;
+					data.count = matchCount;
+					data.selected[0] = '\0';
+					strcpy(data.originalSearch, start);
+					strcpy(data.excludeWords, excludeTemp);
+			
+					INT_PTR result = DialogBoxParam(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_MATCH_LIST),
+													hDlg, MatchListDlgProc, (LPARAM)&data);
+					if (result == IDOK && data.selected[0] != '\0') {
+						strcpy(start, data.selected);
+						SetDlgItemTextA(hDlg, IDC_ITEM_NAME, start);
+						// Restore saved limit, force, exclude
+						SetDlgItemInt(hDlg, IDC_LIMIT, savedLimit, FALSE);
+						CheckDlgButton(hDlg, IDC_FORCE, savedForce ? BST_CHECKED : BST_UNCHECKED);
+						SetDlgItemTextA(hDlg, IDC_EXCLUDE, savedExclude);
+					}
+					else if (result != IDC_USE_ORIGINAL) {
+						free((void*)matches);
+						return TRUE;
+					}
+				}
+				free((void*)matches);
+			
+				// Save final values
 				strcpy(pData->itemName, start);
-			
-				// Read other fields
 				pData->limit = GetDlgItemInt(hDlg, IDC_LIMIT, NULL, FALSE);
 				pData->force = (IsDlgButtonChecked(hDlg, IDC_FORCE) == BST_CHECKED);
 				GetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude, sizeof(pData->exclude));
@@ -423,183 +585,178 @@ INT_PTR CALLBACK ItemEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPar
         }
         break;
     }
-    }
     return FALSE;
 }
 
 static INT_PTR CALLBACK MassAddDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    static HBRUSH hBrush = NULL;
+
     switch (msg)
     {
     case WM_INITDIALOG:
         SetFocus(GetDlgItem(hDlg, IDC_MASS_EDIT));
-        return FALSE;   // let system set focus
+        hBrush = CreateSolidBrush(RGB(170, 170, 170));
+        return FALSE;
+
+    case WM_CTLCOLORDLG:
+        if (hBrush)
+            return (INT_PTR)hBrush;
+        break;
+
+    case WM_CTLCOLORSTATIC:
+        if (hBrush)
+        {
+            SetBkMode((HDC)wParam, TRANSPARENT);
+            SetTextColor((HDC)wParam, RGB(0, 0, 0));
+            return (INT_PTR)hBrush;
+        }
+        break;
+
+    case WM_DRAWITEM:
+    {
+        LPDRAWITEMSTRUCT lpDIS = (LPDRAWITEMSTRUCT)lParam;
+        if (lpDIS->hwndItem == GetDlgItem(hDlg, IDOK) ||
+            lpDIS->hwndItem == GetDlgItem(hDlg, IDCANCEL))
+        {
+            HBRUSH hBrushBg = CreateSolidBrush(RGB(112, 143, 166));
+            FillRect(lpDIS->hDC, &lpDIS->rcItem, hBrushBg);
+            DeleteObject(hBrushBg);
+
+            char text[256];
+            GetWindowTextA(lpDIS->hwndItem, text, sizeof(text));
+            SetBkMode(lpDIS->hDC, TRANSPARENT);
+            SetTextColor(lpDIS->hDC, RGB(0, 0, 0));
+            DrawTextA(lpDIS->hDC, text, -1, &lpDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            if (lpDIS->itemState & ODS_SELECTED)
+                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_SUNKEN, BF_RECT);
+            else
+                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_RAISED, BF_RECT);
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_DESTROY:
+        if (hBrush) DeleteObject(hBrush);
+        break;
 
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
-			
         case IDOK:
-			{
-				char text[65536];
-				GetDlgItemTextA(hDlg, IDC_MASS_EDIT, text, sizeof(text));
-			
-				char *p = text;
-                char line[1024] = { 0 };
-				int lineIdx;
-			
-				while (*p)
-				{
-					// Extract a line
-					lineIdx = 0;
-					while (*p && *p != '\r' && *p != '\n')
-					{
-						if (lineIdx < (int)sizeof(line)-1)
-							line[lineIdx++] = *p;
-						p++;
-					}
-					line[lineIdx] = '\0';
-			
-					// Skip empty lines
-					if (lineIdx == 0)
-					{
-						while (*p == '\r' || *p == '\n') p++;
-						continue;
-					}
-			
-					// Trim leading/trailing spaces from the line
-					char *start = line;
-					while (*start == ' ' || *start == '\t') start++;
-					char *end = start + strlen(start) - 1;
-					while (end > start && (*end == ' ' || *end == '\t')) end--;
-					*(end + 1) = '\0';
-					if (start != line) memmove(line, start, end - start + 2);
-			
-					if (strlen(line) == 0)
-					{
-						while (*p == '\r' || *p == '\n') p++;
-						continue;
-					}
-			
-					// ---------- Parse the line ----------
-					char *ptr = line;
-					int disabled = 0, force = 0;
-			
-					// Optional leading '#'
-					if (*ptr == '#')
-					{
-						disabled = 1;
-						ptr++;
-						while (*ptr == ' ' || *ptr == '\t') ptr++;
-					}
-					// Optional leading '~'
-					if (*ptr == '~')
-					{
-						force = 1;
-						ptr++;
-						while (*ptr == ' ' || *ptr == '\t') ptr++;
-					}
-			
-					// Now parse: item name, then optional ';limit', then optional '^exclude' tokens
-					char itemName[256] = { 0 };
-					itemName[0] = '\0';
-					int limit = 1;          // default limit
-					char excludeWords[256] = { 0 };
-					excludeWords[0] = '\0';
-			
-					// ---- Collect item name: stop at ';' or '^' or end of string ----
-					char *nameStart = ptr;
-					char *nameEnd = nameStart;
-					while (*nameEnd && *nameEnd != ';' && *nameEnd != '^')
-						nameEnd++;
-			
-					// Copy the name
-					int nameLen = (int)(nameEnd - nameStart);
-					if (nameLen >= (int)sizeof(itemName)) nameLen = sizeof(itemName)-1;
-					strncpy(itemName, nameStart, nameLen);
-					itemName[nameLen] = '\0';
-			
-					// Trim trailing spaces from name
-					char *trimEnd = itemName + strlen(itemName) - 1;
-					while (trimEnd >= itemName && (*trimEnd == ' ' || *trimEnd == '\t'))
-						*trimEnd-- = '\0';
-			
-					// Move ptr to after the name
-					ptr = nameEnd;
-			
-					// ---- Parse quantity limit if ';' ----
-					if (*ptr == ';')
-					{
-						ptr++;
-						limit = atoi(ptr);
-						if (limit < 0) limit = 0;
-						// Advance ptr past the number
-						while (*ptr && *ptr != ' ' && *ptr != '^') ptr++;
-					}
-			
-					// ---- Parse exclude words (each starts with '^') ----
-					// They appear as " ^word1 ^word2 ..."
-					while (*ptr)
-					{
-						// Skip spaces
-						while (*ptr == ' ') ptr++;
-						if (*ptr == '^')
-						{
-							ptr++; // skip '^'
-							// Skip any spaces after caret (optional)
-							while (*ptr == ' ') ptr++;
-							// Collect the exclude word (until next space or end)
-							char word[128] = { 0 };
-							int wlen = 0;
-							while (*ptr && *ptr != ' ' && *ptr != '^')
-							{
-								if (wlen < (int)sizeof(word)-1)
-									word[wlen++] = *ptr;
-								ptr++;
-							}
-							word[wlen] = '\0';
-							if (wlen > 0)
-							{
-								// Add to excludeWords list (space separated)
-								if (excludeWords[0] != '\0')
-									strcat(excludeWords, " ");
-								strcat(excludeWords, word);
-							}
-						}
-						else
-						{
-							// Unexpected character – break to avoid infinite loop
-							break;
-						}
-					}
-			
-					// If the item name is empty, skip this line
-					if (strlen(itemName) == 0)
-					{
-						while (*p == '\r' || *p == '\n') p++;
-						continue;
-					}
-			
-					// Build the raw string using the new '^' exclude marker
-					char raw[512];
-					BuildItemString(raw, sizeof(raw), itemName, disabled, force, limit, excludeWords);
-			
-					// Format for display (shows exclude words prefixed with "exclude: ...")
-					char display[1024];
-					FormatItemForDisplay(raw, display, sizeof(display));
-			
-					// Add to active watchlist
-					puDoMethod(g_ItemWatchList, PUM_TABLE_NEWRECORD, 0, 0);
-					puDoMethod(g_ItemWatchList, PUM_TABLE_ADDRECORD, 0, 0);
-					puDoMethod(g_ItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)display, 0);
-			
-					// Skip any trailing newline characters
-					while (*p == '\r' || *p == '\n') p++;
-				}
-			
-				EndDialog(hDlg, IDOK);
-				return TRUE;
-			}
+        {
+            char text[65536];
+            GetDlgItemTextA(hDlg, IDC_MASS_EDIT, text, sizeof(text));
+
+            char *p = text;
+            char line[1024] = { 0 };
+            int lineIdx;
+
+            while (*p)
+            {
+                lineIdx = 0;
+                while (*p && *p != '\r' && *p != '\n')
+                {
+                    if (lineIdx < (int)sizeof(line)-1)
+                        line[lineIdx++] = *p;
+                    p++;
+                }
+                line[lineIdx] = '\0';
+
+                if (lineIdx == 0)
+                {
+                    while (*p == '\r' || *p == '\n') p++;
+                    continue;
+                }
+
+                char *start = line;
+                while (*start == ' ' || *start == '\t') start++;
+                char *end = start + strlen(start) - 1;
+                while (end > start && (*end == ' ' || *end == '\t')) end--;
+                *(end + 1) = '\0';
+                if (start != line) memmove(line, start, end - start + 2);
+
+                if (strlen(line) == 0)
+                {
+                    while (*p == '\r' || *p == '\n') p++;
+                    continue;
+                }
+
+                char *ptr = line;
+                int disabled = 0, force = 0;
+                if (*ptr == '#') { disabled = 1; ptr++; while (*ptr == ' ' || *ptr == '\t') ptr++; }
+                if (*ptr == '~') { force = 1; ptr++; while (*ptr == ' ' || *ptr == '\t') ptr++; }
+
+                char itemName[256] = { 0 };
+                int limit = 1;
+                char excludeWords[256] = { 0 };
+
+                char *nameStart = ptr;
+                char *nameEnd = nameStart;
+                while (*nameEnd && *nameEnd != ';' && *nameEnd != '^') nameEnd++;
+                int nameLen = (int)(nameEnd - nameStart);
+                if (nameLen >= (int)sizeof(itemName)) nameLen = sizeof(itemName)-1;
+                strncpy(itemName, nameStart, nameLen);
+                itemName[nameLen] = '\0';
+
+                char *trimEnd = itemName + strlen(itemName) - 1;
+                while (trimEnd >= itemName && (*trimEnd == ' ' || *trimEnd == '\t'))
+                    *trimEnd-- = '\0';
+
+                ptr = nameEnd;
+                if (*ptr == ';')
+                {
+                    ptr++;
+                    limit = atoi(ptr);
+                    if (limit < 0) limit = 0;
+                    while (*ptr && *ptr != ' ' && *ptr != '^') ptr++;
+                }
+
+                while (*ptr)
+                {
+                    while (*ptr == ' ') ptr++;
+                    if (*ptr == '^')
+                    {
+                        ptr++;
+                        while (*ptr == ' ') ptr++;
+                        char word[128] = { 0 };
+                        int wlen = 0;
+                        while (*ptr && *ptr != ' ' && *ptr != '^')
+                        {
+                            if (wlen < (int)sizeof(word)-1)
+                                word[wlen++] = *ptr;
+                            ptr++;
+                        }
+                        word[wlen] = '\0';
+                        if (wlen > 0)
+                        {
+                            if (excludeWords[0] != '\0')
+                                strcat(excludeWords, " ");
+                            strcat(excludeWords, word);
+                        }
+                    }
+                    else break;
+                }
+
+                if (strlen(itemName) == 0) continue;
+
+                char raw[512];
+                BuildItemString(raw, sizeof(raw), itemName, disabled, force, limit, excludeWords);
+                char display[1024];
+                FormatItemForDisplay(raw, display, sizeof(display));
+
+                puDoMethod(g_ItemWatchList, PUM_TABLE_NEWRECORD, 0, 0);
+                puDoMethod(g_ItemWatchList, PUM_TABLE_ADDRECORD, 0, 0);
+                puDoMethod(g_ItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)display, 0);
+
+                while (*p == '\r' || *p == '\n') p++;
+            }
+
+            EndDialog(hDlg, IDOK);
+            return TRUE;
+        }
 
         case IDCANCEL:
             EndDialog(hDlg, IDCANCEL);
@@ -869,90 +1026,164 @@ static int ParseDisplayString(const char *display, char *itemName, size_t itemNa
 // Move the currently selected item from active list to disabled list
 static void MoveCurrentActiveToDisabled(void)
 {
-    PUU32 listView = puGetObjectFromCollection(g_pCol, CS_ITEMWATCH_LISTVIEW);
+    PULID listView = puGetObjectFromCollection(g_pCol, CS_ITEMWATCH_LISTVIEW);
     int selectedIndex = (int)puGetAttribute(listView, PUA_LISTVIEW_SELECTED);
     if (selectedIndex < 0) {
         ShowModalMessage(NULL, "No item selected.", "ClickSaver", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
-    // Get the record from the active table using the selected index
+    // Get the record from the active table
     PUU32 record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
     for (int i = 0; i < selectedIndex && record; i++)
         record = puDoMethod(g_ItemWatchList, PUM_TABLE_GETNEXTRECORD, record, 0);
-    if (!record) {
-        ShowModalMessage(NULL, "No item selected or could not find the selected record.", "ClickSaver", MB_OK | MB_ICONWARNING);
-        return;
-    }
+    if (!record) return;
 
-    // Get the display string
     PUU8 *display = (PUU8*)puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIELDVAL, record, 0);
-    if (!display || !*display) return;
+    if (!display) return;
 
-    // Add a copy to the disabled table
+    // Add to disabled list
     puDoMethod(g_DisabledItemWatchList, PUM_TABLE_NEWRECORD, 0, 0);
     puDoMethod(g_DisabledItemWatchList, PUM_TABLE_ADDRECORD, 0, 0);
     puDoMethod(g_DisabledItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)display, 0);
 
-    // Remove the selected row from the active listview (also deletes the table record)
+    // Remove from active listview
     puDoMethod(listView, PUM_LISTVIEW_REMOVE, 0, 0);
 
-    // Determine the new selection index
-    // Get the number of rows by checking the last possible selected index
-    int maxRows = (int)puGetAttribute(listView, PUA_LISTVIEW_SELECTED);
-    // If the listview is empty, set to -1
-    if (maxRows == -1) {
+    // Get the new number of rows
+    int numRows = puGetAttribute(g_ItemWatchList, PUA_TABLE_NUMRECORDS);
+    if (numRows > 0) {
+        // Select the same index if it still exists, otherwise the last one
+        int newIndex = (selectedIndex < numRows) ? selectedIndex : numRows - 1;
+        puSetAttribute(listView, PUA_LISTVIEW_SELECTED, newIndex);
+        // Force a redraw of the listview (temporarily toggle the table reference)
+        PULID table = puGetAttribute(listView, PUA_LISTVIEW_TABLE);
+        if (table) {
+            puSetAttribute(listView, PUA_LISTVIEW_TABLE, 0);
+            puSetAttribute(listView, PUA_LISTVIEW_TABLE, table);
+        }
+        puDoMethod(listView, PUM_CONTROL_RELAYOUT, 0, 0);
+    } else {
         puSetAttribute(listView, PUA_LISTVIEW_SELECTED, -1);
-        return;
     }
-    // The new index is the same as the original if it's still within range, else the last row
-    int newIndex = selectedIndex;
-    if (newIndex >= maxRows) {
-        newIndex = maxRows - 1;
-    }
-    puSetAttribute(listView, PUA_LISTVIEW_SELECTED, newIndex);
 }
 
 static void MoveCurrentDisabledToActive(void)
 {
-    PUU32 listView = puGetObjectFromCollection(g_pCol, CS_DISABLED_ITEMWATCH_LISTVIEW);
+    PULID listView = puGetObjectFromCollection(g_pCol, CS_DISABLED_ITEMWATCH_LISTVIEW);
     int selectedIndex = (int)puGetAttribute(listView, PUA_LISTVIEW_SELECTED);
     if (selectedIndex < 0) {
         ShowModalMessage(NULL, "No item selected in disabled list.", "ClickSaver", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
-    // Get the record from the disabled table
     PUU32 record = puDoMethod(g_DisabledItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
     for (int i = 0; i < selectedIndex && record; i++)
         record = puDoMethod(g_DisabledItemWatchList, PUM_TABLE_GETNEXTRECORD, record, 0);
-    if (!record) {
-        ShowModalMessage(NULL, "No item selected or could not find the selected disabled record.", "ClickSaver", MB_OK | MB_ICONWARNING);
-        return;
-    }
+    if (!record) return;
 
     PUU8 *display = (PUU8*)puDoMethod(g_DisabledItemWatchList, PUM_TABLE_GETFIELDVAL, record, 0);
-    if (!display || !*display) return;
+    if (!display) return;
 
-    // Add to active table
     puDoMethod(g_ItemWatchList, PUM_TABLE_NEWRECORD, 0, 0);
     puDoMethod(g_ItemWatchList, PUM_TABLE_ADDRECORD, 0, 0);
     puDoMethod(g_ItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)display, 0);
 
-    // Remove from disabled listview (and its table)
     puDoMethod(listView, PUM_LISTVIEW_REMOVE, 0, 0);
 
-    // Determine new selection in the disabled list
-    int maxRows = (int)puGetAttribute(listView, PUA_LISTVIEW_SELECTED);
-    if (maxRows == -1) {
+    int numRows = puGetAttribute(g_DisabledItemWatchList, PUA_TABLE_NUMRECORDS);
+    if (numRows > 0) {
+        int newIndex = (selectedIndex < numRows) ? selectedIndex : numRows - 1;
+        puSetAttribute(listView, PUA_LISTVIEW_SELECTED, newIndex);
+        PULID table = puGetAttribute(listView, PUA_LISTVIEW_TABLE);
+        if (table) {
+            puSetAttribute(listView, PUA_LISTVIEW_TABLE, 0);
+            puSetAttribute(listView, PUA_LISTVIEW_TABLE, table);
+        }
+        puDoMethod(listView, PUM_CONTROL_RELAYOUT, 0, 0);
+    } else {
         puSetAttribute(listView, PUA_LISTVIEW_SELECTED, -1);
+    }
+}
+
+// ========== Double-click editing functions ==========
+static void EditActiveItem(void)
+{
+    PULID listView = puGetObjectFromCollection(g_pCol, CS_ITEMWATCH_LISTVIEW);
+    int selectedIndex = (int)puGetAttribute(listView, PUA_LISTVIEW_SELECTED);
+    if (selectedIndex < 0) {
+        ShowModalMessage(NULL, "No item selected.", "ClickSaver", MB_OK | MB_ICONINFORMATION);
         return;
     }
-    int newIndex = selectedIndex;
-    if (newIndex >= maxRows) {
-        newIndex = maxRows - 1;
+
+    PUU32 recordKey = puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
+    for (int i = 0; i < selectedIndex && recordKey; i++)
+        recordKey = puDoMethod(g_ItemWatchList, PUM_TABLE_GETNEXTRECORD, recordKey, 0);
+    if (!recordKey) return;
+
+    PUU8* oldStr = (PUU8*)puDoMethod(g_ItemWatchList, PUM_TABLE_GETFIELDVAL, recordKey, 0);
+    if (!oldStr || !*oldStr) return;
+
+    ItemEditData data;
+    memset(&data, 0, sizeof(data));
+    ParseDisplayString((char*)oldStr, data.itemName, sizeof(data.itemName),
+                       &data.disabled, &data.force, &data.limit, data.exclude, sizeof(data.exclude));
+    data.isAdd = 0;
+
+    HWND hMainWnd = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
+    if (ShowItemEditDialog(hMainWnd, &data, 0)) {
+        char rawStr[512], newDisplay[1024];
+        BuildItemString(rawStr, sizeof(rawStr), data.itemName, data.disabled, data.force, data.limit, data.exclude);
+        FormatItemForDisplay(rawStr, newDisplay, sizeof(newDisplay));
+        puSetAttribute(g_ItemWatchList, PUA_TABLE_CURRENTFIELD, 0);
+        puSetAttribute(g_ItemWatchList, PUA_TABLE_CURRENTRECORD, recordKey);
+        puDoMethod(g_ItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)newDisplay, 0);
+        // Force refresh
+        PULID table = puGetAttribute(listView, PUA_LISTVIEW_TABLE);
+        if (table) {
+            puSetAttribute(listView, PUA_LISTVIEW_TABLE, 0);
+            puSetAttribute(listView, PUA_LISTVIEW_TABLE, table);
+        }
     }
-    puSetAttribute(listView, PUA_LISTVIEW_SELECTED, newIndex);
+}
+
+static void EditDisabledItem(void)
+{
+    PULID listView = puGetObjectFromCollection(g_pCol, CS_DISABLED_ITEMWATCH_LISTVIEW);
+    int selectedIndex = (int)puGetAttribute(listView, PUA_LISTVIEW_SELECTED);
+    if (selectedIndex < 0) {
+        ShowModalMessage(NULL, "No item selected in disabled list.", "ClickSaver", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    PUU32 recordKey = puDoMethod(g_DisabledItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0);
+    for (int i = 0; i < selectedIndex && recordKey; i++)
+        recordKey = puDoMethod(g_DisabledItemWatchList, PUM_TABLE_GETNEXTRECORD, recordKey, 0);
+    if (!recordKey) return;
+
+    PUU8* oldStr = (PUU8*)puDoMethod(g_DisabledItemWatchList, PUM_TABLE_GETFIELDVAL, recordKey, 0);
+    if (!oldStr || !*oldStr) return;
+
+    ItemEditData data;
+    memset(&data, 0, sizeof(data));
+    ParseDisplayString((char*)oldStr, data.itemName, sizeof(data.itemName),
+                       &data.disabled, &data.force, &data.limit, data.exclude, sizeof(data.exclude));
+    data.isAdd = 0;
+
+    HWND hMainWnd = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
+    if (ShowItemEditDialog(hMainWnd, &data, 0)) {
+        char rawStr[512], newDisplay[1024];
+        BuildItemString(rawStr, sizeof(rawStr), data.itemName, data.disabled, data.force, data.limit, data.exclude);
+        FormatItemForDisplay(rawStr, newDisplay, sizeof(newDisplay));
+        puSetAttribute(g_DisabledItemWatchList, PUA_TABLE_CURRENTFIELD, 0);
+        puSetAttribute(g_DisabledItemWatchList, PUA_TABLE_CURRENTRECORD, recordKey);
+        puDoMethod(g_DisabledItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)newDisplay, 0);
+        PULID table = puGetAttribute(listView, PUA_LISTVIEW_TABLE);
+        if (table) {
+            puSetAttribute(listView, PUA_LISTVIEW_TABLE, 0);
+            puSetAttribute(listView, PUA_LISTVIEW_TABLE, table);
+        }
+    }
 }
 
 static void RemoveDuplicateItems(void) {
@@ -1568,12 +1799,10 @@ if (!LoadItemNameCache(cachePath)) {
 			}
 		case CSAM_DISABLE_ITEM:
             MoveCurrentActiveToDisabled();
-            puSetAttribute(puGetObjectFromCollection(g_pCol, CS_ITEMWATCH_LISTVIEW), PUA_LISTVIEW_SELECTED, -1);
             break;
 
         case CSAM_ENABLE_ITEM:
             MoveCurrentDisabledToActive();
-            puSetAttribute(puGetObjectFromCollection(g_pCol, CS_DISABLED_ITEMWATCH_LISTVIEW), PUA_LISTVIEW_SELECTED, -1);
             break;
 			
 		case CSAM_MASS_ADD_ITEMS:
@@ -2181,6 +2410,17 @@ if (!LoadItemNameCache(cachePath)) {
             _setSliders( easy_hard, good_bad, order_chaos, open_hidden, phys_myst, headon_stealth, money_xp );
         }
         break;
+		case 5001:
+		{
+			PULID listView = (PULID)pAppMsg->Param;
+			if (listView == puGetObjectFromCollection(g_pCol, CS_ITEMWATCH_LISTVIEW))
+				EditActiveItem();
+			else if (listView == puGetObjectFromCollection(g_pCol, CS_DISABLED_ITEMWATCH_LISTVIEW))
+				EditDisabledItem();
+			break;
+		}
+		
+		
         }
         stop_buying_agent:;
     }
