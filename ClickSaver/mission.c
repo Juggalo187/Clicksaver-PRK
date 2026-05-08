@@ -29,6 +29,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 static char **g_itemNames = NULL;
 static size_t g_numItemNames = 0;
+static PUU8 g_bIsFindItem = 0;
+static PUU8 g_bIsReturnMission = 0;
+static PUU32 g_bRewardMatched = 0;
 extern sqlite3* g_pSQLite;
 
 //#define DEBUG_MISSION_PACKETS 1
@@ -931,17 +934,23 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
         puSetAttribute( puGetObjectFromCollection( _pData->pCol, FOLD ), PUA_FOLD_HILIGHT, bItemNameMatch ? TRUE : FALSE );
     }
 
-     // Find item in description – only for Find Item (0x2c49) and Return Item (0x26add)
-    if (TempVal == 0x2c49 || TempVal == 0x26add) {
-        if (MissionFind(pDesc, DescLength, TempStr)) {
-            WriteLog("find\t%s\n", TempStr);
-            if (SetAndSearch(TempStr, puGetObjectFromCollection(_pData->pCol, FINDITEM), g_ItemWatchList))
-                bItemNameMatch = TRUE;
-        } else {
-            puSetAttribute(puGetObjectFromCollection(_pData->pCol, FINDITEM), PUA_TEXTENTRY_BUFFER, 0);
-            TempStr[0] = '\0';
-        }
-    } else {
+    // Find item in description – only for Find Item (0x2c49) and Return Item (0x26add)
+	if (TempVal == 0x2c49 || TempVal == 0x26add) {
+		if (MissionFind(pDesc, DescLength, TempStr)) {
+			WriteLog("find\t%s\n", TempStr);
+			// Set context for SetAndSearch
+			g_bIsFindItem = 1;
+			g_bIsReturnMission = (TempVal == 0x26add);
+			g_bRewardMatched = bItemNameMatch;
+			int found = SetAndSearch(TempStr, puGetObjectFromCollection(_pData->pCol, FINDITEM), g_ItemWatchList);
+			g_bIsFindItem = 0;
+			if (found)
+				bItemNameMatch = TRUE;
+		} else {
+			puSetAttribute(puGetObjectFromCollection(_pData->pCol, FINDITEM), PUA_TEXTENTRY_BUFFER, 0);
+			TempStr[0] = '\0';
+		}
+	} else {
         // For all other mission types, clear the Find: field
         puSetAttribute(puGetObjectFromCollection(_pData->pCol, FINDITEM), PUA_TEXTENTRY_BUFFER, 0);
         TempStr[0] = '\0';
@@ -1235,24 +1244,30 @@ PUU32 SetAndSearch( PUU8* _pSrcString, PULID _TextEntry, PULID _List ) {
                 }
 
                 if( ItemMatch( TmpItemName, (PUU8*)searchStr ) ) {
-                    // Handle quantity limit
-                    if( limit > 0 ) {
-                        ItemCounter *ic = FindItemCounter( cleanName );
-                        if( !ic ) {
-                            AddItemCounter( cleanName, limit );
-                            ic = FindItemCounter( cleanName );
-                        }
-                        if( ic ) {
-                            if( g_bUpdatingCounters ) {
-                                if (ic->accepted < ic->limit) {
-                                    ic->accepted++;
-                                }
-                            } else if( ic->accepted >= ic->limit ) {
-                                Record = puDoMethod( _List, PUM_TABLE_GETNEXTRECORD, Record, 0 );
-                                continue;
-                            }
-                        }
-                    }
+				// Determine whether to count this match for quantity limits
+				int should_count = 1;
+				if (g_bUpdatingCounters && g_bIsFindItem && g_bIsReturnMission && g_bRewardMatched) {
+					should_count = 0;   // skip counting find item when reward already matched in a Return mission
+				}
+			
+				// Handle quantity limit
+				if( limit > 0 ) {
+					ItemCounter *ic = FindItemCounter( cleanName );
+					if( !ic ) {
+						AddItemCounter( cleanName, limit );
+						ic = FindItemCounter( cleanName );
+					}
+					if( ic ) {
+						if( g_bUpdatingCounters && should_count ) {
+							if (ic->accepted < ic->limit) {
+								ic->accepted++;
+							}
+						} else if( ic->accepted >= ic->limit ) {
+							Record = puDoMethod( _List, PUM_TABLE_GETNEXTRECORD, Record, 0 );
+							continue;
+						}
+					}
+				}
                     
                     // Force-accept flag
                     if( force ) {
