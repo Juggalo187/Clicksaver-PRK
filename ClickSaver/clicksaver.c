@@ -149,7 +149,15 @@ DWORD WINAPI HookManagerThread( void *pParam );
 
 //DB* g_pDB = NULL;
 
-// Add near the top of clicksaver.c, after the #includes and before main()
+static void trim_whitespace(char *str) {
+    char *start = str;
+    while (isspace((unsigned char)*start)) start++;
+    char *end = start + strlen(start);
+    while (end > start && isspace((unsigned char)*(end - 1))) end--;
+    *end = '\0';
+    if (start != str) memmove(str, start, end - start + 1);
+}
+
 static void safe_strcpy(char *dest, size_t dest_size, const char *src)
 {
     if (dest_size == 0) return;
@@ -1336,15 +1344,20 @@ static void ImportItemsFromFile(const char *filename, int replaceMode) {
     int addedCount = 0;
     int duplicateCount = 0;
 
-    while (fgets(line, sizeof(line), fp)) {
-        // Trim newline
-        line[strcspn(line, "\r\n")] = 0;
-
-        if (strcmp(line, "::ItemWatch::") == 0) {
-    inItemSection = 1;
-    continue;
+	while (fgets(line, sizeof(line), fp)) {
+		// Trim newline and other whitespace
+		line[strcspn(line, "\r\n")] = '\0';
+		trim_whitespace(line);   // ← remove leading/trailing spaces
+	
+		if (strcmp(line, "::ItemWatch::") == 0) {
+			inItemSection = 1;
+			continue;
 		}
-		// Skip empty lines
+		if (strcmp(line, "::END::") == 0 || strncmp(line, "::", 2) == 0)
+			break;
+		if (!inItemSection) continue;
+	
+		// Skip empty lines after trimming
 		if (strlen(line) == 0) continue;
 		
 		// Parse raw line into fields
