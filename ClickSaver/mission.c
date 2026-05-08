@@ -201,30 +201,48 @@ int LoadItemNameCache(const char *cacheFilePath) {
     FILE *f = fopen(cacheFilePath, "rb");
     if (!f) return 0;
 
-    unsigned long origSize, compSize;
+    unsigned long origSize = 0, compSize = 0;
+
     if (fread(&origSize, 4, 1, f) != 1) { fclose(f); return 0; }
     if (fread(&compSize, 4, 1, f) != 1) { fclose(f); return 0; }
 
-    unsigned char *comp = malloc(compSize);
+    // Sanity checks – prevent huge allocations
+    if (origSize > 50 * 1024 * 1024 || compSize > 50 * 1024 * 1024) {
+        fclose(f);
+        return 0;
+    }
+
+    unsigned char *comp = (unsigned char*)malloc(compSize);
     if (!comp) { fclose(f); return 0; }
     if (fread(comp, 1, compSize, f) != compSize) {
-        free(comp); fclose(f); return 0;
+        free(comp);
+        fclose(f);
+        return 0;
     }
-    fclose(f);
+    fclose(f);   // done reading file
 
-    unsigned char *data = malloc(origSize);
+    unsigned char *data = (unsigned char*)malloc(origSize);
     if (!data) { free(comp); return 0; }
-    if (uncompress(data, &origSize, comp, compSize) != Z_OK) {
-        free(data); free(comp); return 0;
+
+    unsigned long destLen = origSize;
+    if (uncompress(data, &destLen, comp, compSize) != Z_OK) {
+        free(data);
+        free(comp);
+        return 0;
     }
     free(comp);
 
-    // Split by '\0' and fill g_itemNames
+    if (destLen != origSize) {
+        free(data);
+        return 0;
+    }
+
+    // Split the data into strings (original logic)
     size_t count = 0;
     for (size_t i = 0; i < origSize; i++) {
         if (data[i] == '\0') count++;
     }
-    g_itemNames = malloc(count * sizeof(char*));
+    g_itemNames = (char**)malloc(count * sizeof(char*));
     if (!g_itemNames) { free(data); return 0; }
 
     size_t idx = 0;
@@ -238,7 +256,7 @@ int LoadItemNameCache(const char *cacheFilePath) {
         }
     }
     g_numItemNames = idx;
-    free(data);
+    free(data);   // free the raw buffer
 
     // Sort for binary search
     qsort(g_itemNames, g_numItemNames, sizeof(char*),
@@ -766,8 +784,16 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
     Item* pTmpItem;
     PUU32 NumItems = 0, i;
     pusObjectCollection* pPrevCol;
+	CharKey[0] = '\0';
 
     pEndMissionData = _pMissionData + 65536 - 4;
+	
+	#define CHECK_BOUNDS(ptr, offset) \
+    if ((PUU8*)(ptr) + (offset) > pEndMissionData) { \
+        puSetAttribute(puGetObjectFromCollection(_pData->pCol, ROOTOBJ), PUA_CONTROL_HIDDEN, TRUE); \
+        return 0; \
+    }
+	
     bAlertItem = puGetAttribute( puGetObjectFromCollection( g_pCol, CS_ALERTITEM_CB ), PUA_CHECKBOX_CHECKED );
     bAlertLoc = puGetAttribute( puGetObjectFromCollection( g_pCol, CS_ALERTLOC_CB ), PUA_CHECKBOX_CHECKED );
     bAlertType = puGetAttribute( puGetObjectFromCollection( g_pCol, CS_ALERTTYPE_CB ), PUA_CHECKBOX_CHECKED );
@@ -784,18 +810,18 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
         _pMissionData++;
         TempVal = EndianSwap32( *(PUU32*)_pMissionData );
     } while( TempVal != 0xdac3 );
+    CHECK_BOUNDS(_pMissionData, 0x04 + 4);
+    MishID = EndianSwap32( *(PUU32*)(_pMissionData + 0x04) );
+    _pMissionData += 6 * 4;
+    CHECK_BOUNDS(_pMissionData, 0);
 
     puSetAttribute( puGetObjectFromCollection( _pData->pCol, ROOTOBJ ), PUA_CONTROL_HIDDEN, FALSE );
 
-#ifdef DEBUG_MISSION_PACKETS
-    WriteDebug( "\nMission Header:\n" );
-    DebugPacket( _pMissionData, 6 * 4 );
-    WriteDebug( 0 );
-#endif
-
-    MishID = EndianSwap32( *(PUU32*)(_pMissionData + 0x04) );
-    _pMissionData += 6 * 4;
-    if( _pMissionData >= pEndMissionData ) return 0;
+	#ifdef DEBUG_MISSION_PACKETS
+		WriteDebug( "\nMission Header:\n" );
+		DebugPacket( _pMissionData, 6 * 4 );
+		WriteDebug( 0 );
+	#endif
 
     // Skip short description (null terminated)
     while( *_pMissionData ) _pMissionData++;
@@ -814,6 +840,7 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
 
     if( (pEndMissionData - _pMissionData) < 0xe8 ) return 0;
 
+	CHECK_BOUNDS(_pMissionData, 0x14 + 4);
     Cash = EndianSwap32( *(PUU32*)(_pMissionData + 0xc) );
     TotalValue = Cash;
     XP = EndianSwap32( *(PUU32*)(_pMissionData + 0x14) );
@@ -834,6 +861,7 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
     _pMissionData = ((PUU8*)pTmpItem) + 4;
     if( _pMissionData >= pEndMissionData ) return 0;
 
+	CHECK_BOUNDS(_pMissionData, 0xc + 4);
     MishQL = EndianSwap32( *(PUU32*)(_pMissionData + 0xc) );
 
     pPrevCol = _pData->pCol;
@@ -853,6 +881,7 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
     }
 
     // Playfield and coordinates
+	CHECK_BOUNDS(_pMissionData, 0xbc + 4);
     MishPF = EndianSwap32( *(PUU32*)(_pMissionData + 0xA8) );
     MissionPF( MishPF, PFName );
     TempVal = EndianSwap32( *(PUU32*)(_pMissionData + 0xb4) );
@@ -863,6 +892,7 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
     bLocFound = SetAndSearch( TempStr, puGetObjectFromCollection( _pData->pCol, LOCATION ), g_LocWatchList );
 
     // Mission type
+	CHECK_BOUNDS(_pMissionData, 0x28 + 4);
     TempVal = EndianSwap32( *(PUU32*)(_pMissionData + 0x28) );
     bTypeFound = SetAndSearchType( TempVal, puGetObjectFromCollection( _pData->pCol, MISHTYPE ) );
 
@@ -953,7 +983,7 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
             }
         }
     }
-
+	#undef CHECK_BOUNDS
     return (PUU32)_pMissionData;
 }
 

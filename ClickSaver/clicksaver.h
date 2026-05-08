@@ -12,6 +12,15 @@
 #include "mission.h"
 #include "sqlite3.h"
 
+#ifdef __GNUC__
+#define PRINTF_ATTR(a,b) __attribute__((format(printf, a, b)))
+#else
+#define PRINTF_ATTR(a,b)
+#endif
+
+void WriteLog( const char* Format, ... ) PRINTF_ATTR(1,2);
+void WriteDebug( const char* txt ) PRINTF_ATTR(1,2);
+
 // AO Resource Type Constants
 #define AODB_TYP_ITEM       1000020
 #define AODB_TYP_ICON       1010008
@@ -187,5 +196,6 @@ void* GetDataChunk( PUU32 _KeyHi, PUU32 _KeyLo, PUU32* _pSize );
 void DebugPacket( void* pData, unsigned int length );
 void WriteLog( const char* Format, ... );
 void WriteDebug( const char* txt );
+
 
 #endif

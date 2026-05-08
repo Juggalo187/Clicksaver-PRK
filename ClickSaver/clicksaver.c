@@ -149,6 +149,23 @@ DWORD WINAPI HookManagerThread( void *pParam );
 
 //DB* g_pDB = NULL;
 
+// Add near the top of clicksaver.c, after the #includes and before main()
+static void safe_strcpy(char *dest, size_t dest_size, const char *src)
+{
+    if (dest_size == 0) return;
+    strncpy(dest, src, dest_size - 1);
+    dest[dest_size - 1] = '\0';
+}
+
+static void safe_strcat(char *dest, size_t dest_size, const char *src)
+{
+    size_t used = strlen(dest);
+    size_t remaining = dest_size - used;
+    if (remaining <= 1) return;
+    strncat(dest, src, remaining - 1);
+    dest[dest_size - 1] = '\0';
+}
+
 // Helper: Show a modal message box that appears on top of the topmost main window
 static int ShowModalMessage(HWND hParent, const char* text, const char* caption, UINT type)
 {
@@ -798,32 +815,47 @@ static LRESULT CALLBACK BAWndProcHook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 
 
 // ========== Helper functions for item string format ==========
-void BuildItemString(char *dest, size_t destSize,
-                     const char *itemName,
-                     int disabled,
-                     int forceAccept,
-                     int quantityLimit,
+void BuildItemString(char *dest, size_t destSize, const char *itemName,
+                     int disabled, int forceAccept, int quantityLimit,
                      const char *excludeWords)
 {
     dest[0] = '\0';
-    if (disabled) strncat(dest, "#", destSize - strlen(dest) - 1);
-    if (forceAccept) strncat(dest, "~", destSize - strlen(dest) - 1);
-    strncat(dest, itemName, destSize - strlen(dest) - 1);
-    if (quantityLimit > 0) {
-        char buf[16];
-        sprintf(buf, ";%d", quantityLimit);
-        strncat(dest, buf, destSize - strlen(dest) - 1);
+    int len = 0;
+
+    if (disabled) {
+        len = snprintf(dest, destSize, "#");
+        if (len < 0 || (size_t)len >= destSize) goto trunc;
     }
+    if (forceAccept) {
+        len += snprintf(dest + len, destSize - len, "~");
+        if (len < 0 || (size_t)len >= destSize) goto trunc;
+    }
+    len += snprintf(dest + len, destSize - len, "%s", itemName);
+    if (len < 0 || (size_t)len >= destSize) goto trunc;
+
+    if (quantityLimit > 0) {
+        len += snprintf(dest + len, destSize - len, ";%d", quantityLimit);
+        if (len < 0 || (size_t)len >= destSize) goto trunc;
+    }
+
     if (excludeWords && *excludeWords) {
         char *tmp = _strdup(excludeWords);
-        char *token = strtok(tmp, ", ");
-        while (token) {
-            strncat(dest, " ^", destSize - strlen(dest) - 2);
-            strncat(dest, token, destSize - strlen(dest) - 1);
-            token = strtok(NULL, ", ");
+        if (tmp) {
+            char *token = strtok(tmp, ", ");
+            while (token) {
+                len += snprintf(dest + len, destSize - len, " ^%s", token);
+                if (len < 0 || (size_t)len >= destSize) {
+                    free(tmp);
+                    goto trunc;
+                }
+                token = strtok(NULL, ", ");
+            }
+            free(tmp);
         }
-        free(tmp);
     }
+    return;
+trunc:
+    dest[destSize - 1] = '\0';
 }
 
 void ParseItemString(const char *src,
@@ -906,38 +938,47 @@ void FormatItemForDisplay(const char *raw, char *out, size_t outSize)
     char itemName[256];
     int disabled = 0, force = 0, limit = 0;
     char exclude[256];
-
     ParseItemString(raw, itemName, sizeof(itemName), &disabled, &force, &limit, exclude, sizeof(exclude));
 
     out[0] = '\0';
-    strncat(out, itemName, outSize - strlen(out) - 1);
+    int len = 0;
 
-    if (disabled)
-        strncat(out, " [disabled]", outSize - strlen(out) - 1);
-    if (force)
-        strncat(out, " [force accept]", outSize - strlen(out) - 1);
+    // Use snprintf to build safely
+    len = snprintf(out, outSize, "%s", itemName);
+    if (len < 0 || (size_t)len >= outSize) goto truncation;
+
+    if (disabled) {
+        len += snprintf(out + len, outSize - len, " [disabled]");
+        if (len < 0 || (size_t)len >= outSize) goto truncation;
+    }
+    if (force) {
+        len += snprintf(out + len, outSize - len, " [force accept]");
+        if (len < 0 || (size_t)len >= outSize) goto truncation;
+    }
     if (limit > 0) {
-        char buf[32];
-        sprintf(buf, " [qty %d]", limit);
-        strncat(out, buf, outSize - strlen(out) - 1);
+        len += snprintf(out + len, outSize - len, " [qty %d]", limit);
+        if (len < 0 || (size_t)len >= outSize) goto truncation;
     }
     if (exclude[0]) {
-        // Build comma-separated list from space-separated exclude words
         char buf[512];
         char tmp[256];
-        strncpy(tmp, exclude, sizeof(tmp) - 1);
-        tmp[sizeof(tmp) - 1] = '\0';
-
+        safe_strcpy(tmp, sizeof(tmp), exclude); // use our safe copy
         char *tok = strtok(tmp, " ");
         char formatted[256] = "";
         while (tok) {
-            if (formatted[0]) strncat(formatted, ", ", sizeof(formatted) - strlen(formatted) - 1);
-            strncat(formatted, tok, sizeof(formatted) - strlen(formatted) - 1);
+            if (formatted[0]) safe_strcat(formatted, sizeof(formatted), ", ");
+            safe_strcat(formatted, sizeof(formatted), tok);
             tok = strtok(NULL, " ");
         }
-        sprintf(buf, " [exclude: %s]", formatted);
-        strncat(out, buf, outSize - strlen(out) - 1);
+        snprintf(buf, sizeof(buf), " [exclude: %s]", formatted);
+        len += snprintf(out + len, outSize - len, "%s", buf);
+        if (len < 0 || (size_t)len >= outSize) goto truncation;
     }
+    return;
+
+truncation:
+    // If truncation happened, ensure null termination
+    out[outSize - 1] = '\0';
 }
 
 // Build the string stored in the item watchlist table.
@@ -1389,7 +1430,16 @@ ItemCounter* FindItemCounter(const char *name) {
 void AddItemCounter(const char *name, int limit) {
     if (limit <= 0) return;
     ItemCounter *new = (ItemCounter*)malloc(sizeof(ItemCounter));
+    if (!new) {
+        DisplayErrorMessage("Out of memory in AddItemCounter", TRUE);
+        return;
+    }
     new->itemName = _strdup(name);
+    if (!new->itemName) {
+        free(new);
+        DisplayErrorMessage("Out of memory in AddItemCounter (strdup)", TRUE);
+        return;
+    }
     new->limit = limit;
     new->accepted = 0;
     new->next = g_ItemCounters;
@@ -1496,6 +1546,11 @@ void* GetDataChunk(PUU32 _KeyHi, PUU32 _KeyLo, PUU32* _pSize)
 			for (int i = 0; i + 12 <= blobSize; i++) {
 				if (*(PUU32*)(blob + i) == 0x15 && *(PUU32*)(blob + i + 4) == 0x21) {
 					unsigned short nameLen = *(unsigned short*)(blob + i + 8);
+					// Bounds check: ensure name fits within blob
+					if (i + 12 + nameLen > blobSize) {
+						// Name would be truncated – skip this match
+						continue;
+					}
 					if (nameLen > AODB_MAX_NAME_LEN) nameLen = AODB_MAX_NAME_LEN;
 					memcpy(pItem->pName, blob + i + 12, nameLen);
 					pItem->pName[nameLen] = 0;
@@ -2610,7 +2665,7 @@ void ImportSettings( char* filename )
             break;
 
         case ISM_CONFIG:
-            if( sscanf( buffer, "%[^:]::%[^\n]\n", Keyword, Value ) != EOF )
+            if( sscanf( buffer, "%255[^:]::%255[^\n]\n", Keyword, Value ) != EOF )
             {
                 i = 0, Id = -1;
                 while( CfgKeywords[ i ].keyword )
@@ -2626,7 +2681,7 @@ void ImportSettings( char* filename )
                 switch( Id )
                 {
 				case CFG_AODIR:
-					strcpy( g_AODir, Value );
+					safe_strcpy(g_AODir, MAX_PATH, Value);
 					break;
 				case CFG_WINDOWX:
 					sscanf( Value, "%d", &iVal );
