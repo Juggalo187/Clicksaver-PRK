@@ -32,6 +32,7 @@ static size_t g_numItemNames = 0;
 static PUU8 g_bIsFindItem = 0;
 static PUU8 g_bIsReturnMission = 0;
 static PUU32 g_bRewardMatched = 0;
+extern PULID g_DisabledItemWatchList;
 extern sqlite3* g_pSQLite;
 
 //#define DEBUG_MISSION_PACKETS 1
@@ -1257,22 +1258,44 @@ PUU32 SetAndSearch( PUU8* _pSrcString, PULID _TextEntry, PULID _List ) {
 			
 				// Handle quantity limit
 				if( limit > 0 ) {
-						ItemCounter *ic = FindItemCounter( cleanName );
-						if( !ic ) {
-							AddItemCounter( cleanName, limit );
-							ic = FindItemCounter( cleanName );
-						}
-						if( ic ) {
-							if( g_bUpdatingCounters && should_count ) {
-								if (ic->accepted < ic->limit) {
-									ic->accepted++;
+					ItemCounter *ic = FindItemCounter( cleanName );
+					if( !ic ) {
+						AddItemCounter( cleanName, limit );
+						ic = FindItemCounter( cleanName );
+					}
+					if( ic ) {
+						if( g_bUpdatingCounters && should_count ) {
+							if (ic->accepted < ic->limit) {
+								ic->accepted++;
+							}
+							// ===== NEW: Auto‑move when limit is reached =====
+							if (ic->accepted == ic->limit) {
+								// Move this entry from Active to Disabled list
+								PUU32 nextRecord = puDoMethod(_List, PUM_TABLE_GETNEXTRECORD, Record, 0);
+								// Add to disabled list (same display string)
+								puDoMethod(g_DisabledItemWatchList, PUM_TABLE_NEWRECORD, 0, 0);
+								puDoMethod(g_DisabledItemWatchList, PUM_TABLE_ADDRECORD, 0, 0);
+								puDoMethod(g_DisabledItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)pString, 0);
+								// Remove from active list
+								puDoMethod(_List, PUM_TABLE_REMRECORD, Record, 0);
+								// Force refresh of the Active listview
+								PULID listView = puGetObjectFromCollection(g_pCol, CS_ITEMWATCH_LISTVIEW);
+								PULID table = puGetAttribute(listView, PUA_LISTVIEW_TABLE);
+								if (table) {
+									puSetAttribute(listView, PUA_LISTVIEW_TABLE, 0);
+									puSetAttribute(listView, PUA_LISTVIEW_TABLE, table);
 								}
-							} else if( ic->accepted >= ic->limit ) {
-								Record = puDoMethod( _List, PUM_TABLE_GETNEXTRECORD, Record, 0 );
+								// Continue loop with the next record
+								Record = nextRecord;
 								continue;
 							}
+							// ===== End of new code =====
+						} else if( ic->accepted >= ic->limit ) {
+							Record = puDoMethod( _List, PUM_TABLE_GETNEXTRECORD, Record, 0 );
+							continue;
 						}
 					}
+				}
                     
                     // Force-accept flag
                     if( force ) {
