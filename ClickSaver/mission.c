@@ -1110,6 +1110,9 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
     TempVal = EndianSwap32( *(PUU32*)(_pMissionData + 0xbc) );
     *(PUU32*)(&CoordY) = TempVal;
     sprintf( TempStr, "%s (%.1f, %.1f)", PFName, CoordX, CoordY );
+    if (g_bBuyingAgentActive) {
+		addLocationStat(PFName, MishPF, CoordX, CoordY);
+	}
     bLocFound = SetAndSearch( TempStr, puGetObjectFromCollection( _pData->pCol, LOCATION ), g_LocWatchList );
 
     // Mission type

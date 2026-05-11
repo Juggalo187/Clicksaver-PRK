@@ -85,7 +85,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "comctl32.lib")
 
+
 #define MATCH_AUTO_THRESHOLD 1
+
+static HWND g_hLocStatsWnd = NULL;
 
 // SQLite Globals
 sqlite3*      g_pSQLite = NULL;
@@ -111,8 +114,8 @@ int BuyingAgent( int delay );
 void EndBuyingAgent();
 void UpdateAcceptedCountersForMission( int mishIndex );
 
-extern PUU8 g_bForceUIRefresh;
-extern PUU32 g_GUIDef[];
+PUU8 g_bForceUIRefresh;
+PUU32 g_GUIDef[];
 pusObjectCollection* g_pCol;
 PULID g_ItemWatchList, g_LocWatchList, g_MainWin;
 PULID g_DisabledItemWatchList;
@@ -134,6 +137,8 @@ PUU8 g_bForceUIRefresh = 0;
 PUU8 g_bPaused = 0;
 int g_BAWindowX = 300;
 int g_BAWindowY = 100;
+int g_LocStatsX = -1;
+int g_LocStatsY = -1;
 void EditActiveItem(void);
 void EditDisabledItem(void);
 char g_CurrentPacket[ 65536 ];
@@ -148,6 +153,89 @@ HANDLE g_hAbortEvent = NULL;      // kept for compatibility, not used in timer v
 DWORD WINAPI HookManagerThread( void *pParam );
 
 //DB* g_pDB = NULL;
+
+// ========== CENTRALIZED DIALOG COLORING ==========
+static HBRUSH g_hDialogBgBrush = NULL;   // RGB(170,170,170)
+static HBRUSH g_hButtonBgBrush = NULL;   // RGB(112,143,166)
+
+static const char* const PROP_BUTTON_IDS = "ClickSaver_OwnerDrawButtons";
+
+void InitDialogColors(void) {
+    if (!g_hDialogBgBrush)
+        g_hDialogBgBrush = CreateSolidBrush(RGB(170, 170, 170));
+    if (!g_hButtonBgBrush)
+        g_hButtonBgBrush = CreateSolidBrush(RGB(112, 143, 166));
+}
+
+void FreeDialogColors(void) {
+    if (g_hDialogBgBrush) DeleteObject(g_hDialogBgBrush);
+    if (g_hButtonBgBrush) DeleteObject(g_hButtonBgBrush);
+    g_hDialogBgBrush = NULL;
+    g_hButtonBgBrush = NULL;
+}
+
+
+static LRESULT CALLBACK DialogColorSubclass(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+    switch (uMsg) {
+        case WM_CTLCOLORDLG:
+        case WM_CTLCOLORSTATIC:
+            if (g_hDialogBgBrush) {
+                SetBkMode((HDC)wParam, TRANSPARENT);
+                SetTextColor((HDC)wParam, RGB(0, 0, 0));
+                return (LRESULT)g_hDialogBgBrush;
+            }
+            break;
+
+        case WM_DRAWITEM: {
+            LPDRAWITEMSTRUCT lpDIS = (LPDRAWITEMSTRUCT)lParam;
+            // Retrieve the array of button IDs stored for this dialog
+            const int* buttonIds = (const int*)GetPropA(hDlg, PROP_BUTTON_IDS);
+            if (buttonIds) {
+                for (int i = 0; buttonIds[i] != 0; i++) {
+                    if (lpDIS->hwndItem == GetDlgItem(hDlg, buttonIds[i])) {
+                        // Draw the button using the global button brush
+                        FillRect(lpDIS->hDC, &lpDIS->rcItem, g_hButtonBgBrush);
+                        char text[256];
+                        GetWindowTextA(lpDIS->hwndItem, text, sizeof(text));
+                        SetBkMode(lpDIS->hDC, TRANSPARENT);
+                        SetTextColor(lpDIS->hDC, RGB(0, 0, 0));
+                        DrawTextA(lpDIS->hDC, text, -1, &lpDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                        if (lpDIS->itemState & ODS_SELECTED)
+                            DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_SUNKEN, BF_RECT);
+                        else
+                            DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_RAISED, BF_RECT);
+                        return TRUE;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    return DefSubclassProc(hDlg, uMsg, wParam, lParam);
+}
+
+void EnableDialogColors(HWND hDlg, const int* buttonIds) {
+    if (buttonIds) {
+        // Copy the button IDs into a global heap so they survive for the subclass proc
+        int count = 0;
+        while (buttonIds[count] != 0) count++;
+        int* copy = (int*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (count + 1) * sizeof(int));
+        if (copy) {
+            memcpy(copy, buttonIds, count * sizeof(int));
+            copy[count] = 0;
+            SetPropA(hDlg, PROP_BUTTON_IDS, (HANDLE)copy);
+        }
+    }
+    // Subclass the dialog
+    SetWindowSubclass(hDlg, DialogColorSubclass, 0, 0);
+}
+
+void DisableDialogColors(HWND hDlg) {
+    RemoveWindowSubclass(hDlg, DialogColorSubclass, 0);
+    HANDLE hMem = RemovePropA(hDlg, PROP_BUTTON_IDS);
+    if (hMem) HeapFree(GetProcessHeap(), 0, hMem);
+}
+
 
 static void trim_whitespace(char *str) {
     char *start = str;
@@ -173,6 +261,17 @@ static void safe_strcat(char *dest, size_t dest_size, const char *src)
     strncat(dest, src, remaining - 1);
     dest[dest_size - 1] = '\0';
 }
+
+// Location statistics
+typedef struct LocStat {
+    char pfName[128];
+    int pfId;
+    int xc, yc;
+    int count;
+    struct LocStat *next;
+} LocStat;
+
+static LocStat *g_locStats = NULL;
 
 // Helper: Show a modal message box that appears on top of the topmost main window
 static int ShowModalMessage(HWND hParent, const char* text, const char* caption, UINT type)
@@ -261,573 +360,379 @@ static void UrlEncode(const char *src, char *dst, size_t dstSize)
     dst[i] = '\0';
 }
 
-static INT_PTR CALLBACK MatchListDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    // Use a unique name to avoid conflict with global pData
+INT_PTR CALLBACK MatchListDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     MatchListData *pMatchData = (MatchListData*)GetWindowLongPtr(hDlg, DWLP_USER);
-    static HBRUSH hBrush = NULL;
 
-    switch (msg)
-    {
-    case WM_INITDIALOG:
-    {
-        pMatchData = (MatchListData*)lParam;
-        SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)pMatchData);
-
-        HWND hList = GetDlgItem(hDlg, IDC_MATCH_LIST);
-        for (int i = 0; i < pMatchData->count; i++) {
-            SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)pMatchData->matches[i]);
-        }
-
-        char hint[512];
-        if (pMatchData->excludeWords[0] != '\0') {
-            sprintf(hint, "Hint: Double-click an item to select it.\n\nUsing original term \"%s\" with exclusions (%s) matches %d item(s).",
-                    pMatchData->originalSearch, pMatchData->excludeWords, pMatchData->count);
-        } else {
-            sprintf(hint, "Hint: Double-click an item to select it.\n\nUsing original term \"%s\" matches %d item(s).",
-                    pMatchData->originalSearch, pMatchData->count);
-        }
-        SetDlgItemTextA(hDlg, IDC_MATCH_HINT, hint);
-
-        SetFocus(GetDlgItem(hDlg, IDC_MATCH_EDIT));
-
-        hBrush = CreateSolidBrush(RGB(170, 170, 170));
-        return FALSE;
-    }
-
-    case WM_CTLCOLORDLG:
-    case WM_CTLCOLORSTATIC:
-        if (hBrush) {
-            SetBkMode((HDC)wParam, TRANSPARENT);
-            SetTextColor((HDC)wParam, RGB(0, 0, 0));
-            return (INT_PTR)hBrush;
-        }
-        break;
-
-    case WM_DRAWITEM:
-    {
-        LPDRAWITEMSTRUCT lpDIS = (LPDRAWITEMSTRUCT)lParam;
-        if (lpDIS->hwndItem == GetDlgItem(hDlg, IDC_USE_ORIGINAL) ||
-            lpDIS->hwndItem == GetDlgItem(hDlg, IDC_USE_TYPED) ||
-            lpDIS->hwndItem == GetDlgItem(hDlg, IDC_LOOKUP_AUNO) ||
-            lpDIS->hwndItem == GetDlgItem(hDlg, IDCANCEL))
-        {
-            HBRUSH hBrushBg = CreateSolidBrush(RGB(112, 143, 166));
-            FillRect(lpDIS->hDC, &lpDIS->rcItem, hBrushBg);
-            DeleteObject(hBrushBg);
-
-            char text[256];
-            GetWindowTextA(lpDIS->hwndItem, text, sizeof(text));
-            SetBkMode(lpDIS->hDC, TRANSPARENT);
-            SetTextColor(lpDIS->hDC, RGB(0, 0, 0));
-            DrawTextA(lpDIS->hDC, text, -1, &lpDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-            if (lpDIS->itemState & ODS_SELECTED)
-                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_SUNKEN, BF_RECT);
-            else
-                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_RAISED, BF_RECT);
-
-            return TRUE;
-        }
-        break;
-    }
-
-    case WM_DESTROY:
-        if (hBrush) DeleteObject(hBrush);
-        break;
-
-    case WM_COMMAND:
-    {
-        WORD wID = LOWORD(wParam);
-        if (wID == IDC_USE_ORIGINAL) {
-            pMatchData->selected[0] = '\0';
-            EndDialog(hDlg, IDC_USE_ORIGINAL);
-            return TRUE;
-        }
-        else if (wID == IDC_USE_TYPED) {
-            char typed[256];
-            GetDlgItemTextA(hDlg, IDC_MATCH_EDIT, typed, sizeof(typed));
-            if (strlen(typed) == 0) {
-                MessageBoxA(hDlg, "Please enter a name or click Cancel.", "Empty Name", MB_OK | MB_ICONWARNING);
-                return TRUE;
-            }
-
-            int newMatchCount = 0;
-            const char **newMatches = NULL;
-            GetFilteredMatchingItems(typed, pMatchData->excludeWords, &newMatches, &newMatchCount);
-            free((void*)newMatches);
-
-            char msg[512];
-            sprintf(msg, "Your typed name \"%s\" would match %d item(s).\n\nUse this name?", typed, newMatchCount);
-            if (MessageBoxA(hDlg, msg, "Confirm Typed Name", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                strcpy(pMatchData->selected, typed);
-                EndDialog(hDlg, IDOK);
-            }
-            return TRUE;
-        }
-        else if (wID == IDCANCEL) {
-            EndDialog(hDlg, IDCANCEL);
-            return TRUE;
-        }
-        else if (wID == IDC_MATCH_LIST && HIWORD(wParam) == LBN_DBLCLK) {
+    switch (msg) {
+        case WM_INITDIALOG: {
+            pMatchData = (MatchListData*)lParam;
+            SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)pMatchData);
             HWND hList = GetDlgItem(hDlg, IDC_MATCH_LIST);
-            int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
-            if (sel != LB_ERR) {
-                SendMessageA(hList, LB_GETTEXT, sel, (LPARAM)pMatchData->selected);
-                EndDialog(hDlg, IDOK);
+            for (int i = 0; i < pMatchData->count; i++) {
+                SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)pMatchData->matches[i]);
             }
-            return TRUE;
-        }
-        else if (wID == IDC_LOOKUP_AUNO) {
-            char searchTerm[256] = {0};
-            HWND hList = GetDlgItem(hDlg, IDC_MATCH_LIST);
-            int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
-            if (sel != LB_ERR) {
-                SendMessageA(hList, LB_GETTEXT, sel, (LPARAM)searchTerm);
+            char hint[512];
+            if (pMatchData->excludeWords[0] != '\0') {
+                sprintf(hint, "Hint: Double-click an item to select it.\n\nUsing original term \"%s\" with exclusions (%s) matches %d item(s).",
+                        pMatchData->originalSearch, pMatchData->excludeWords, pMatchData->count);
             } else {
-                GetDlgItemTextA(hDlg, IDC_MATCH_EDIT, searchTerm, sizeof(searchTerm));
+                sprintf(hint, "Hint: Double-click an item to select it.\n\nUsing original term \"%s\" matches %d item(s).",
+                        pMatchData->originalSearch, pMatchData->count);
             }
+            SetDlgItemTextA(hDlg, IDC_MATCH_HINT, hint);
+            SetFocus(GetDlgItem(hDlg, IDC_MATCH_EDIT));
+            // Enable centralized coloring for owner-drawn buttons
+            static const int buttons[] = { IDC_USE_ORIGINAL, IDC_USE_TYPED, IDC_LOOKUP_AUNO, IDCANCEL, 0 };
+            EnableDialogColors(hDlg, buttons);
+            return FALSE;
+        }
 
-            if (searchTerm[0] == '\0') {
-                MessageBoxA(hDlg, "No item selected or typed.", "Lookup", MB_OK | MB_ICONINFORMATION);
+        case WM_DESTROY:
+            DisableDialogColors(hDlg);
+            break;
+
+        case WM_COMMAND: {
+            WORD wID = LOWORD(wParam);
+            if (wID == IDC_USE_ORIGINAL) {
+                pMatchData->selected[0] = '\0';
+                EndDialog(hDlg, IDC_USE_ORIGINAL);
+                return TRUE;
+            } else if (wID == IDC_USE_TYPED) {
+                char typed[256];
+                GetDlgItemTextA(hDlg, IDC_MATCH_EDIT, typed, sizeof(typed));
+                if (strlen(typed) == 0) {
+                    MessageBoxA(hDlg, "Please enter a name or click Cancel.", "Empty Name", MB_OK | MB_ICONWARNING);
+                    return TRUE;
+                }
+                int newMatchCount = 0;
+                const char **newMatches = NULL;
+                GetFilteredMatchingItems(typed, pMatchData->excludeWords, &newMatches, &newMatchCount);
+                free((void*)newMatches);
+                char msg[512];
+                sprintf(msg, "Your typed name \"%s\" would match %d item(s).\n\nUse this name?", typed, newMatchCount);
+                if (MessageBoxA(hDlg, msg, "Confirm Typed Name", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                    strcpy(pMatchData->selected, typed);
+                    EndDialog(hDlg, IDOK);
+                }
+                return TRUE;
+            } else if (wID == IDCANCEL) {
+                EndDialog(hDlg, IDCANCEL);
+                return TRUE;
+            } else if (wID == IDC_MATCH_LIST && HIWORD(wParam) == LBN_DBLCLK) {
+                HWND hList = GetDlgItem(hDlg, IDC_MATCH_LIST);
+                int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+                if (sel != LB_ERR) {
+                    SendMessageA(hList, LB_GETTEXT, sel, (LPARAM)pMatchData->selected);
+                    EndDialog(hDlg, IDOK);
+                }
+                return TRUE;
+            } else if (wID == IDC_LOOKUP_AUNO) {
+                char searchTerm[256] = {0};
+                HWND hList = GetDlgItem(hDlg, IDC_MATCH_LIST);
+                int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+                if (sel != LB_ERR) {
+                    SendMessageA(hList, LB_GETTEXT, sel, (LPARAM)searchTerm);
+                } else {
+                    GetDlgItemTextA(hDlg, IDC_MATCH_EDIT, searchTerm, sizeof(searchTerm));
+                }
+                if (searchTerm[0] == '\0') {
+                    MessageBoxA(hDlg, "No item selected or typed.", "Lookup", MB_OK | MB_ICONINFORMATION);
+                    return TRUE;
+                }
+                // Minimize main window
+                if (g_MainWin) {
+                    HWND hMain = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
+                    if (hMain && IsWindow(hMain)) {
+                        ShowWindow(hMain, SW_MINIMIZE);
+                    }
+                }
+                char encoded[512];
+                UrlEncode(searchTerm, encoded, sizeof(encoded));
+                char url[1024];
+                sprintf(url, "https://auno.org/ao/db.php?cmd=search&name=%s", encoded);
+                HINSTANCE result = ShellExecuteA(hDlg, "open", url, NULL, NULL, SW_SHOWNORMAL);
+                if ((int)result <= 32) {
+                    char errMsg[256];
+                    sprintf(errMsg, "Failed to open browser for:\n%s", url);
+                    MessageBoxA(hDlg, errMsg, "Lookup Error", MB_OK | MB_ICONERROR);
+                }
                 return TRUE;
             }
-			
-			// Minimize ClickSaver main window
-			if (g_MainWin) {
-				HWND hMain = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
-				if (hMain && IsWindow(hMain)) {
-					ShowWindow(hMain, SW_MINIMIZE);
-				}
-			}
-
-            char encoded[512];
-            UrlEncode(searchTerm, encoded, sizeof(encoded));
-            char url[1024];
-            sprintf(url, "https://auno.org/ao/db.php?cmd=search&name=%s", encoded);
-
-            HINSTANCE result = ShellExecuteA(hDlg, "open", url, NULL, NULL, SW_SHOWNORMAL);
-            if ((int)result <= 32) {
-                char errMsg[256];
-                sprintf(errMsg, "Failed to open browser for:\n%s", url);
-                MessageBoxA(hDlg, errMsg, "Lookup Error", MB_OK | MB_ICONERROR);
-            }
-            return TRUE;
+            break;
         }
-        break;
-    }
     }
     return FALSE;
 }
 
-// Forward declarations
-INT_PTR CALLBACK ItemEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam);
-int ShowItemEditDialog(HWND hParent, ItemEditData *pData, int bIsAddMode);
-
-// Dialog procedure for the native edit/add dialog
-INT_PTR CALLBACK ItemEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
-{
+INT_PTR CALLBACK ItemEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     ItemEditData *pData = (ItemEditData*)GetWindowLongPtr(hDlg, DWLP_USER);
-    static HBRUSH hBrush = NULL;
 
-    switch (msg)
-    {
-    case WM_INITDIALOG:
-    {
-        pData = (ItemEditData*)lParam;
-        SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)pData);
+    switch (msg) {
+        case WM_INITDIALOG: {
+            pData = (ItemEditData*)lParam;
+            SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)pData);
 
-        if (pData->isAdd)
-            SetWindowTextA(hDlg, "Add Item");
-        else
-            SetWindowTextA(hDlg, "Edit Item");
-
-        SetDlgItemTextA(hDlg, IDC_ITEM_NAME, pData->itemName);
-        SetDlgItemInt(hDlg, IDC_LIMIT, pData->limit, FALSE);
-        CheckDlgButton(hDlg, IDC_FORCE, pData->force ? BST_CHECKED : BST_UNCHECKED);
-        SetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude);
-
-        hBrush = CreateSolidBrush(RGB(170, 170, 170));
-        return TRUE;
-    }
-
-    case WM_CTLCOLORDLG:
-    case WM_CTLCOLORSTATIC:
-        if (hBrush)
-        {
-            SetBkMode((HDC)wParam, TRANSPARENT);
-            SetTextColor((HDC)wParam, RGB(0, 0, 0));
-            return (INT_PTR)hBrush;
-        }
-        break;
-
-    case WM_DRAWITEM:
-    {
-        LPDRAWITEMSTRUCT lpDIS = (LPDRAWITEMSTRUCT)lParam;
-        if (lpDIS->hwndItem == GetDlgItem(hDlg, IDOK) ||
-            lpDIS->hwndItem == GetDlgItem(hDlg, IDCANCEL))
-        {
-            HBRUSH hBrushBg = CreateSolidBrush(RGB(112, 143, 166));
-            FillRect(lpDIS->hDC, &lpDIS->rcItem, hBrushBg);
-            DeleteObject(hBrushBg);
-
-            char text[256];
-            GetWindowTextA(lpDIS->hwndItem, text, sizeof(text));
-            SetBkMode(lpDIS->hDC, TRANSPARENT);
-            SetTextColor(lpDIS->hDC, RGB(0, 0, 0));
-            DrawTextA(lpDIS->hDC, text, -1, &lpDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-            if (lpDIS->itemState & ODS_SELECTED)
-                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_SUNKEN, BF_RECT);
+            if (pData->isAdd)
+                SetWindowTextA(hDlg, "Add Item");
             else
-                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_RAISED, BF_RECT);
+                SetWindowTextA(hDlg, "Edit Item");
+
+            SetDlgItemTextA(hDlg, IDC_ITEM_NAME, pData->itemName);
+            SetDlgItemInt(hDlg, IDC_LIMIT, pData->limit, FALSE);
+            CheckDlgButton(hDlg, IDC_FORCE, pData->force ? BST_CHECKED : BST_UNCHECKED);
+            SetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude);
+
+            // Enable centralized coloring
+            static const int buttons[] = { IDOK, IDCANCEL, 0 };
+            EnableDialogColors(hDlg, buttons);
             return TRUE;
         }
-        break;
-    }
 
-    case WM_DESTROY:
-        if (hBrush) DeleteObject(hBrush);
-        break;
+        case WM_DESTROY:
+            DisableDialogColors(hDlg);
+            break;
 
-    case WM_COMMAND:
-        switch (LOWORD(wParam))
-        {
-        case IDOK:
-			{
-				char enteredName[256];
-				GetDlgItemTextA(hDlg, IDC_ITEM_NAME, enteredName, sizeof(enteredName));
-			
-				// Trim spaces
-				char *start = enteredName;
-				while (*start == ' ') start++;
-				char *end = start + strlen(start) - 1;
-				while (end > start && *end == ' ') end--;
-				*(end + 1) = '\0';
-				if (strlen(start) == 0) {
-					MessageBoxA(hDlg, "Item name cannot be empty.", "Validation", MB_OK | MB_ICONWARNING);
-					return TRUE;
-				}
-			
-				// Get exclude words
-				char excludeTemp[256];
-				GetDlgItemTextA(hDlg, IDC_EXCLUDE, excludeTemp, sizeof(excludeTemp));
-			
-				// If editing an existing item and the name hasn't changed, skip validation
-				if (!pData->isAdd && strcmp(start, pData->itemName) == 0) {
-					// Name unchanged – just keep existing quantity/force/exclude
-					strcpy(pData->itemName, start);
-					pData->limit = GetDlgItemInt(hDlg, IDC_LIMIT, NULL, FALSE);
-					pData->force = (IsDlgButtonChecked(hDlg, IDC_FORCE) == BST_CHECKED);
-					GetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude, sizeof(pData->exclude));
-					EndDialog(hDlg, IDOK);
-					return TRUE;
-				}
-			
-				// ---- NEW: Strip surrounding double quotes for cache search ----
-				char searchName[256];
-				strcpy(searchName, start);
-				int hasQuotes = 0;
-				size_t len = strlen(searchName);
-				if (len >= 2 && searchName[0] == '"' && searchName[len-1] == '"') {
-					hasQuotes = 1;
-					// Remove the quotes
-					memmove(searchName, searchName + 1, len - 2);
-					searchName[len - 2] = '\0';
-					// Trim again (in case of spaces inside quotes? Usually not, but safe)
-					char *qstart = searchName;
-					while (*qstart == ' ') qstart++;
-					char *qend = qstart + strlen(qstart) - 1;
-					while (qend > qstart && *qend == ' ') qend--;
-					*(qend + 1) = '\0';
-					if (qstart != searchName) memmove(searchName, qstart, qend - qstart + 2);
-				}
-				// ------------------------------------------------------------
-			
-				// Normalize: convert dashes and collapse spaces (same as before)
-				char normalized[256];
-				strcpy(normalized, searchName);
-				for (char *p = normalized; *p; p++) {
-					if (*p == '-') {
-						if ((p == normalized || *(p-1) == ' ') && (*(p+1) == ' ' || *(p+1) == '\0')) {
-							*p = ' ';
-						}
-					}
-				}
-				// Collapse multiple spaces into one
-				char *dst = normalized;
-				int space = 0;
-				for (char *src = normalized; *src; src++) {
-					if (*src == ' ') {
-						if (!space) *dst++ = ' ';
-						space = 1;
-					} else {
-						*dst++ = *src;
-						space = 0;
-					}
-				}
-				*dst = '\0';
-			
-				int matchCount = 0;
-				const char **matches = NULL;
-				GetFilteredMatchingItems(normalized, excludeTemp, &matches, &matchCount);
-			
-				if (matchCount == 0) {
-					char msg[512];
-					sprintf(msg, "Item \"%s\" does not match any known item.\n\nAdd it anyway?", start);
-					if (MessageBoxA(hDlg, msg, "Unknown Item", MB_YESNO | MB_ICONQUESTION) != IDYES) {
-						free((void*)matches);
-						return TRUE;
-					}
-				}
-				else if (matchCount <= MATCH_AUTO_THRESHOLD) {
-					// Silent accept – use typed name as is
-				}
-				else {
-					// Save current limit, force, exclude before showing match list
-					int savedLimit = GetDlgItemInt(hDlg, IDC_LIMIT, NULL, FALSE);
-					BOOL savedForce = IsDlgButtonChecked(hDlg, IDC_FORCE);
-					char savedExclude[256];
-					GetDlgItemTextA(hDlg, IDC_EXCLUDE, savedExclude, sizeof(savedExclude));
-			
-					// Automatically show match list
-					MatchListData data;
-					data.matches = matches;
-					data.count = matchCount;
-					data.selected[0] = '\0';
-					strcpy(data.originalSearch, start);
-					strcpy(data.excludeWords, excludeTemp);
-			
-					INT_PTR result = DialogBoxParam(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_MATCH_LIST),
-													hDlg, MatchListDlgProc, (LPARAM)&data);
-					if (result == IDOK && data.selected[0] != '\0') {
-						// User selected an item from the list – use that exact name (without quotes)
-						strcpy(start, data.selected);
-						hasQuotes = 0;  // Selected item is not quoted
-						SetDlgItemTextA(hDlg, IDC_ITEM_NAME, start);
-						// Restore saved limit, force, exclude
-						SetDlgItemInt(hDlg, IDC_LIMIT, savedLimit, FALSE);
-						CheckDlgButton(hDlg, IDC_FORCE, savedForce ? BST_CHECKED : BST_UNCHECKED);
-						SetDlgItemTextA(hDlg, IDC_EXCLUDE, savedExclude);
-					}
-					else if (result != IDC_USE_ORIGINAL) {
-						free((void*)matches);
-						return TRUE;
-					}
-				}
-				free((void*)matches);
-			
-				// Save final values – if the user originally entered quotes, preserve them
-				// But if we went through the match list and selected an exact name, we lose the quotes.
-				// That's intended because the exact name doesn't need quotes.
-				if (hasQuotes && strlen(start) > 0 && start[0] != '"') {
-					// Re‑add quotes since the user wanted an exact phrase match
-					char quoted[256];
-					snprintf(quoted, sizeof(quoted), "\"%s\"", start);
-					strcpy(pData->itemName, quoted);
-				} else {
-					strcpy(pData->itemName, start);
-				}
-				pData->limit = GetDlgItemInt(hDlg, IDC_LIMIT, NULL, FALSE);
-				pData->force = (IsDlgButtonChecked(hDlg, IDC_FORCE) == BST_CHECKED);
-				GetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude, sizeof(pData->exclude));
-			
-				EndDialog(hDlg, IDOK);
-				return TRUE;
-			}
+        case WM_COMMAND:
+            switch (LOWORD(wParam)) {
+                case IDOK: {
+                    char enteredName[256];
+                    GetDlgItemTextA(hDlg, IDC_ITEM_NAME, enteredName, sizeof(enteredName));
+                    // Trim spaces
+                    char *start = enteredName;
+                    while (*start == ' ') start++;
+                    char *end = start + strlen(start) - 1;
+                    while (end > start && *end == ' ') end--;
+                    *(end + 1) = '\0';
+                    if (strlen(start) == 0) {
+                        MessageBoxA(hDlg, "Item name cannot be empty.", "Validation", MB_OK | MB_ICONWARNING);
+                        return TRUE;
+                    }
 
-        case IDCANCEL:
-            EndDialog(hDlg, IDCANCEL);
-            return TRUE;
-        }
-        break;
-    }
-    return FALSE;
-}
+                    char excludeTemp[256];
+                    GetDlgItemTextA(hDlg, IDC_EXCLUDE, excludeTemp, sizeof(excludeTemp));
 
-static INT_PTR CALLBACK MassAddDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    static HBRUSH hBrush = NULL;
+                    // If editing and name unchanged, skip validation
+                    if (!pData->isAdd && strcmp(start, pData->itemName) == 0) {
+                        strcpy(pData->itemName, start);
+                        pData->limit = GetDlgItemInt(hDlg, IDC_LIMIT, NULL, FALSE);
+                        pData->force = (IsDlgButtonChecked(hDlg, IDC_FORCE) == BST_CHECKED);
+                        GetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude, sizeof(pData->exclude));
+                        EndDialog(hDlg, IDOK);
+                        return TRUE;
+                    }
 
-    switch (msg)
-    {
-    case WM_INITDIALOG:
-        SetFocus(GetDlgItem(hDlg, IDC_MASS_EDIT));
-        hBrush = CreateSolidBrush(RGB(170, 170, 170));
-        return FALSE;
+                    // Strip quotes for cache search
+                    char searchName[256];
+                    strcpy(searchName, start);
+                    int hasQuotes = 0;
+                    size_t len = strlen(searchName);
+                    if (len >= 2 && searchName[0] == '"' && searchName[len-1] == '"') {
+                        hasQuotes = 1;
+                        memmove(searchName, searchName + 1, len - 2);
+                        searchName[len - 2] = '\0';
+                        char *qstart = searchName;
+                        while (*qstart == ' ') qstart++;
+                        char *qend = qstart + strlen(qstart) - 1;
+                        while (qend > qstart && *qend == ' ') qend--;
+                        *(qend + 1) = '\0';
+                        if (qstart != searchName) memmove(searchName, qstart, qend - qstart + 2);
+                    }
 
-    case WM_CTLCOLORDLG:
-        if (hBrush)
-            return (INT_PTR)hBrush;
-        break;
-
-    case WM_CTLCOLORSTATIC:
-        if (hBrush)
-        {
-            SetBkMode((HDC)wParam, TRANSPARENT);
-            SetTextColor((HDC)wParam, RGB(0, 0, 0));
-            return (INT_PTR)hBrush;
-        }
-        break;
-
-    case WM_DRAWITEM:
-    {
-        LPDRAWITEMSTRUCT lpDIS = (LPDRAWITEMSTRUCT)lParam;
-        if (lpDIS->hwndItem == GetDlgItem(hDlg, IDOK) ||
-            lpDIS->hwndItem == GetDlgItem(hDlg, IDCANCEL))
-        {
-            HBRUSH hBrushBg = CreateSolidBrush(RGB(112, 143, 166));
-            FillRect(lpDIS->hDC, &lpDIS->rcItem, hBrushBg);
-            DeleteObject(hBrushBg);
-
-            char text[256];
-            GetWindowTextA(lpDIS->hwndItem, text, sizeof(text));
-            SetBkMode(lpDIS->hDC, TRANSPARENT);
-            SetTextColor(lpDIS->hDC, RGB(0, 0, 0));
-            DrawTextA(lpDIS->hDC, text, -1, &lpDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-            if (lpDIS->itemState & ODS_SELECTED)
-                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_SUNKEN, BF_RECT);
-            else
-                DrawEdge(lpDIS->hDC, &lpDIS->rcItem, EDGE_RAISED, BF_RECT);
-            return TRUE;
-        }
-        break;
-    }
-
-    case WM_DESTROY:
-        if (hBrush) DeleteObject(hBrush);
-        break;
-
-    case WM_COMMAND:
-        switch (LOWORD(wParam))
-        {
-        case IDOK:
-        {
-            char text[65536];
-            GetDlgItemTextA(hDlg, IDC_MASS_EDIT, text, sizeof(text));
-
-            char *p = text;
-            char line[1024] = { 0 };
-            int lineIdx;
-
-            while (*p)
-            {
-                lineIdx = 0;
-                while (*p && *p != '\r' && *p != '\n')
-                {
-                    if (lineIdx < (int)sizeof(line)-1)
-                        line[lineIdx++] = *p;
-                    p++;
-                }
-                line[lineIdx] = '\0';
-
-                if (lineIdx == 0)
-                {
-                    while (*p == '\r' || *p == '\n') p++;
-                    continue;
-                }
-
-                char *start = line;
-                while (*start == ' ' || *start == '\t') start++;
-                char *end = start + strlen(start) - 1;
-                while (end > start && (*end == ' ' || *end == '\t')) end--;
-                *(end + 1) = '\0';
-                if (start != line) memmove(line, start, end - start + 2);
-
-                if (strlen(line) == 0)
-                {
-                    while (*p == '\r' || *p == '\n') p++;
-                    continue;
-                }
-
-                char *ptr = line;
-                int disabled = 0, force = 0;
-                if (*ptr == '#') { disabled = 1; ptr++; while (*ptr == ' ' || *ptr == '\t') ptr++; }
-                if (*ptr == '~') { force = 1; ptr++; while (*ptr == ' ' || *ptr == '\t') ptr++; }
-
-                char itemName[256] = { 0 };
-                int limit = 1;
-                char excludeWords[256] = { 0 };
-
-                char *nameStart = ptr;
-                char *nameEnd = nameStart;
-                while (*nameEnd && *nameEnd != ';' && *nameEnd != '^') nameEnd++;
-                int nameLen = (int)(nameEnd - nameStart);
-                if (nameLen >= (int)sizeof(itemName)) nameLen = sizeof(itemName)-1;
-                strncpy(itemName, nameStart, nameLen);
-                itemName[nameLen] = '\0';
-
-                char *trimEnd = itemName + strlen(itemName) - 1;
-                while (trimEnd >= itemName && (*trimEnd == ' ' || *trimEnd == '\t'))
-                    *trimEnd-- = '\0';
-
-                ptr = nameEnd;
-                if (*ptr == ';')
-                {
-                    ptr++;
-                    limit = atoi(ptr);
-					if (limit < 0) limit = 0;
-					if (limit == 0) {
-						limit = 1;
-					}
-                    while (*ptr && *ptr != ' ' && *ptr != '^') ptr++;
-                }
-
-                while (*ptr)
-                {
-                    while (*ptr == ' ') ptr++;
-                    if (*ptr == '^')
-                    {
-                        ptr++;
-                        while (*ptr == ' ') ptr++;
-                        char word[128] = { 0 };
-                        int wlen = 0;
-                        while (*ptr && *ptr != ' ' && *ptr != '^')
-                        {
-                            if (wlen < (int)sizeof(word)-1)
-                                word[wlen++] = *ptr;
-                            ptr++;
-                        }
-                        word[wlen] = '\0';
-                        if (wlen > 0)
-                        {
-                            if (excludeWords[0] != '\0')
-                                strcat(excludeWords, " ");
-                            strcat(excludeWords, word);
+                    // Normalize
+                    char normalized[256];
+                    strcpy(normalized, searchName);
+                    for (char *p = normalized; *p; p++) {
+                        if (*p == '-') {
+                            if ((p == normalized || *(p-1) == ' ') && (*(p+1) == ' ' || *(p+1) == '\0'))
+                                *p = ' ';
                         }
                     }
-                    else break;
+                    char *dst = normalized;
+                    int space = 0;
+                    for (char *src = normalized; *src; src++) {
+                        if (*src == ' ') {
+                            if (!space) *dst++ = ' ';
+                            space = 1;
+                        } else {
+                            *dst++ = *src;
+                            space = 0;
+                        }
+                    }
+                    *dst = '\0';
+
+                    int matchCount = 0;
+                    const char **matches = NULL;
+                    GetFilteredMatchingItems(normalized, excludeTemp, &matches, &matchCount);
+
+                    if (matchCount == 0) {
+                        char msg[512];
+                        sprintf(msg, "Item \"%s\" does not match any known item.\n\nAdd it anyway?", start);
+                        if (MessageBoxA(hDlg, msg, "Unknown Item", MB_YESNO | MB_ICONQUESTION) != IDYES) {
+                            free((void*)matches);
+                            return TRUE;
+                        }
+                    } else if (matchCount > MATCH_AUTO_THRESHOLD) {
+                        int savedLimit = GetDlgItemInt(hDlg, IDC_LIMIT, NULL, FALSE);
+                        BOOL savedForce = IsDlgButtonChecked(hDlg, IDC_FORCE);
+                        char savedExclude[256];
+                        GetDlgItemTextA(hDlg, IDC_EXCLUDE, savedExclude, sizeof(savedExclude));
+
+                        MatchListData data;
+                        data.matches = matches;
+                        data.count = matchCount;
+                        data.selected[0] = '\0';
+                        strcpy(data.originalSearch, start);
+                        strcpy(data.excludeWords, excludeTemp);
+
+                        INT_PTR result = DialogBoxParam(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_MATCH_LIST),
+                                                        hDlg, MatchListDlgProc, (LPARAM)&data);
+                        if (result == IDOK && data.selected[0] != '\0') {
+                            strcpy(start, data.selected);
+                            hasQuotes = 0;
+                            SetDlgItemTextA(hDlg, IDC_ITEM_NAME, start);
+                            SetDlgItemInt(hDlg, IDC_LIMIT, savedLimit, FALSE);
+                            CheckDlgButton(hDlg, IDC_FORCE, savedForce ? BST_CHECKED : BST_UNCHECKED);
+                            SetDlgItemTextA(hDlg, IDC_EXCLUDE, savedExclude);
+                        } else if (result != IDC_USE_ORIGINAL) {
+                            free((void*)matches);
+                            return TRUE;
+                        }
+                    }
+                    free((void*)matches);
+
+                    if (hasQuotes && strlen(start) > 0 && start[0] != '"') {
+                        char quoted[256];
+                        snprintf(quoted, sizeof(quoted), "\"%s\"", start);
+                        strcpy(pData->itemName, quoted);
+                    } else {
+                        strcpy(pData->itemName, start);
+                    }
+                    pData->limit = GetDlgItemInt(hDlg, IDC_LIMIT, NULL, FALSE);
+                    pData->force = (IsDlgButtonChecked(hDlg, IDC_FORCE) == BST_CHECKED);
+                    GetDlgItemTextA(hDlg, IDC_EXCLUDE, pData->exclude, sizeof(pData->exclude));
+                    EndDialog(hDlg, IDOK);
+                    return TRUE;
                 }
 
-                if (strlen(itemName) == 0) continue;
-
-                char raw[512];
-                BuildItemString(raw, sizeof(raw), itemName, disabled, force, limit, excludeWords);
-                char display[1024];
-                FormatItemForDisplay(raw, display, sizeof(display));
-
-                puDoMethod(g_ItemWatchList, PUM_TABLE_NEWRECORD, 0, 0);
-                puDoMethod(g_ItemWatchList, PUM_TABLE_ADDRECORD, 0, 0);
-                puDoMethod(g_ItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)display, 0);
-
-                while (*p == '\r' || *p == '\n') p++;
+                case IDCANCEL:
+                    EndDialog(hDlg, IDCANCEL);
+                    return TRUE;
             }
-
-            EndDialog(hDlg, IDOK);
-            return TRUE;
-        }
-
-        case IDCANCEL:
-            EndDialog(hDlg, IDCANCEL);
-            return TRUE;
-        }
-        break;
+            break;
     }
     return FALSE;
 }
 
-// Show the dialog and return 1 if OK, 0 if cancelled
+INT_PTR CALLBACK MassAddDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_INITDIALOG:
+            SetFocus(GetDlgItem(hDlg, IDC_MASS_EDIT));
+            // Enable centralized coloring (OK and Cancel buttons)
+            static const int buttons[] = { IDOK, IDCANCEL, 0 };
+            EnableDialogColors(hDlg, buttons);
+            return FALSE;
+
+        case WM_DESTROY:
+            DisableDialogColors(hDlg);
+            break;
+
+        case WM_COMMAND:
+            switch (LOWORD(wParam)) {
+                case IDOK: {
+                    char text[65536];
+                    GetDlgItemTextA(hDlg, IDC_MASS_EDIT, text, sizeof(text));
+                    char *p = text;
+                    char line[1024] = {0};
+                    int lineIdx;
+                    while (*p) {
+                        lineIdx = 0;
+                        while (*p && *p != '\r' && *p != '\n') {
+                            if (lineIdx < (int)sizeof(line)-1)
+                                line[lineIdx++] = *p;
+                            p++;
+                        }
+                        line[lineIdx] = '\0';
+                        if (lineIdx == 0) {
+                            while (*p == '\r' || *p == '\n') p++;
+                            continue;
+                        }
+                        char *start = line;
+                        while (*start == ' ' || *start == '\t') start++;
+                        char *end = start + strlen(start) - 1;
+                        while (end > start && (*end == ' ' || *end == '\t')) end--;
+                        *(end + 1) = '\0';
+                        if (start != line) memmove(line, start, end - start + 2);
+                        if (strlen(line) == 0) {
+                            while (*p == '\r' || *p == '\n') p++;
+                            continue;
+                        }
+                        char *ptr = line;
+                        int disabled = 0, force = 0;
+                        if (*ptr == '#') { disabled = 1; ptr++; while (*ptr == ' ' || *ptr == '\t') ptr++; }
+                        if (*ptr == '~') { force = 1; ptr++; while (*ptr == ' ' || *ptr == '\t') ptr++; }
+                        char itemName[256] = {0};
+                        int limit = 1;
+                        char excludeWords[256] = {0};
+                        char *nameStart = ptr;
+                        char *nameEnd = nameStart;
+                        while (*nameEnd && *nameEnd != ';' && *nameEnd != '^') nameEnd++;
+                        int nameLen = (int)(nameEnd - nameStart);
+                        if (nameLen >= (int)sizeof(itemName)) nameLen = sizeof(itemName)-1;
+                        strncpy(itemName, nameStart, nameLen);
+                        itemName[nameLen] = '\0';
+                        char *trimEnd = itemName + strlen(itemName) - 1;
+                        while (trimEnd >= itemName && (*trimEnd == ' ' || *trimEnd == '\t'))
+                            *trimEnd-- = '\0';
+                        ptr = nameEnd;
+                        if (*ptr == ';') {
+                            ptr++;
+                            limit = atoi(ptr);
+                            if (limit < 0) limit = 0;
+                            if (limit == 0) limit = 1;
+                            while (*ptr && *ptr != ' ' && *ptr != '^') ptr++;
+                        }
+                        while (*ptr) {
+                            while (*ptr == ' ') ptr++;
+                            if (*ptr == '^') {
+                                ptr++;
+                                while (*ptr == ' ') ptr++;
+                                char word[128] = {0};
+                                int wlen = 0;
+                                while (*ptr && *ptr != ' ' && *ptr != '^') {
+                                    if (wlen < (int)sizeof(word)-1)
+                                        word[wlen++] = *ptr;
+                                    ptr++;
+                                }
+                                word[wlen] = '\0';
+                                if (wlen > 0) {
+                                    if (excludeWords[0] != '\0')
+                                        strcat(excludeWords, " ");
+                                    strcat(excludeWords, word);
+                                }
+                            } else break;
+                        }
+                        if (strlen(itemName) == 0) continue;
+                        char raw[512];
+                        BuildItemString(raw, sizeof(raw), itemName, disabled, force, limit, excludeWords);
+                        char display[1024];
+                        FormatItemForDisplay(raw, display, sizeof(display));
+                        puDoMethod(g_ItemWatchList, PUM_TABLE_NEWRECORD, 0, 0);
+                        puDoMethod(g_ItemWatchList, PUM_TABLE_ADDRECORD, 0, 0);
+                        puDoMethod(g_ItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)display, 0);
+                        while (*p == '\r' || *p == '\n') p++;
+                    }
+                    EndDialog(hDlg, IDOK);
+                    return TRUE;
+                }
+                case IDCANCEL:
+                    EndDialog(hDlg, IDCANCEL);
+                    return TRUE;
+            }
+            break;
+    }
+    return FALSE;
+}
+
 int ShowItemEditDialog(HWND hParent, ItemEditData *pData, int bIsAddMode)
 {
     HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hParent, GWLP_HINSTANCE);
@@ -1677,6 +1582,179 @@ static int HasActiveWatchlistItems()
     return FALSE;
 }
 
+INT_PTR CALLBACK LocStatsDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_INITDIALOG: {
+            static const int buttons[] = { IDC_COPY_WAYPOINT_BTN, IDC_COPY_TO_LOCWATCH_BTN, IDC_CLOSE_BTN, IDC_EXPORT_LIST_BTN, 0 };
+            EnableDialogColors(hDlg, buttons);
+            return TRUE;
+        }
+
+        case WM_DESTROY:
+            DisableDialogColors(hDlg);
+            g_hLocStatsWnd = NULL;
+            break;
+		case WM_MOVE:
+			{
+				RECT r;
+				GetWindowRect(hDlg, &r);
+				g_LocStatsX = r.left;
+				g_LocStatsY = r.top;
+				break;
+			}
+
+        case WM_COMMAND:
+            switch (LOWORD(wParam)) {
+                case IDC_CLOSE_BTN:
+                    DestroyWindow(hDlg);
+                    break;
+                case IDC_COPY_WAYPOINT_BTN: {
+                    HWND hList = GetDlgItem(hDlg, IDC_LOC_STATS_LIST);
+                    if (!hList) return TRUE;
+                    int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+                    if (sel == LB_ERR) {
+                        ShowModalMessage(NULL, "No location selected.\nClick on a location first.", "Error", MB_OK);
+                        return TRUE;
+                    }
+                    // Get stored pfId from item data
+                    int pfNumber = (int)SendMessage(hList, LB_GETITEMDATA, sel, 0);
+                    if (pfNumber == 0) {
+                        ShowModalMessage(NULL, "No playfield ID associated with this entry.", "Error", MB_OK);
+                        return TRUE;
+                    }
+                    char lineBuf[1024];
+                    SendMessageA(hList, LB_GETTEXT, sel, (LPARAM)lineBuf);
+                    char pfName[256];
+                    int xmin, xmax, ymin, ymax;
+                    if (sscanf(lineBuf, "%*d) %255[^(] (%d-%d, %d-%d)", pfName, &xmin, &xmax, &ymin, &ymax) != 5) {
+                        ShowModalMessage(NULL, "Could not parse the selected line.", "Error", MB_OK);
+                        return TRUE;
+                    }
+                    int xc = (xmin + xmax) / 2;
+                    int yc = (ymin + ymax) / 2;
+                    char cmd[256];
+                    sprintf(cmd, "/waypoint %d %d %d", xc, yc, pfNumber);
+                    if (OpenClipboard(NULL)) {
+                        EmptyClipboard();
+                        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, strlen(cmd) + 1);
+                        if (hMem) {
+                            memcpy(GlobalLock(hMem), cmd, strlen(cmd) + 1);
+                            GlobalUnlock(hMem);
+                            SetClipboardData(CF_TEXT, hMem);
+                        }
+                        CloseClipboard();
+                        ShowModalMessage(NULL, cmd, "Command copied to clipboard", MB_OK);
+                    } else {
+                        ShowModalMessage(NULL, "Failed to open clipboard.", "Error", MB_OK);
+                    }
+                    return TRUE;
+                }
+				case IDC_COPY_TO_LOCWATCH_BTN: {
+                    HWND hList = GetDlgItem(hDlg, IDC_LOC_STATS_LIST);
+                    if (!hList) return TRUE;
+                    int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+                    if (sel == LB_ERR) {
+                        ShowModalMessage(NULL, "No location selected.\nClick on a location first.", "Error", MB_OK);
+                        return TRUE;
+                    }
+
+                    // Get the display line text
+                    char lineBuf[1024];
+                    SendMessageA(hList, LB_GETTEXT, sel, (LPARAM)lineBuf);
+                    char pfName[256];
+                    int xmin, xmax, ymin, ymax;
+                    // Parse: "1) Andromeda (450-550, 1750-1850) (2 times)"
+                    if (sscanf(lineBuf, "%*d) %255[^(] (%d-%d, %d-%d)", pfName, &xmin, &xmax, &ymin, &ymax) != 5) {
+                        ShowModalMessage(NULL, "Could not parse the selected line.", "Error", MB_OK);
+                        return TRUE;
+                    }
+
+                    // Trim spaces from playfield name
+                    char *ptr = pfName + strlen(pfName) - 1;
+                    while (ptr > pfName && (*ptr == ' ' || *ptr == '\t')) *ptr-- = '\0';
+
+                    // Build location watch string (same format as used in location matching)
+                    char locEntry[512];
+                    sprintf(locEntry, "%s (%d-%d, %d-%d)", pfName, xmin, xmax, ymin, ymax);
+
+                    // Add to the global location watch list (table)
+                    puDoMethod(g_LocWatchList, PUM_TABLE_NEWRECORD, 0, 0);
+                    puDoMethod(g_LocWatchList, PUM_TABLE_ADDRECORD, 0, 0);
+                    puDoMethod(g_LocWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)locEntry, 0);
+
+                    // Force refresh of the location watch listview in the main window
+                    PULID locListView = puGetObjectFromCollection(g_pCol, CS_LOCWATCH_LISTVIEW);
+                    if (locListView) {
+                        // Toggle table reference to trigger redraw
+                        PULID oldTable = puGetAttribute(locListView, PUA_LISTVIEW_TABLE);
+                        if (oldTable) {
+                            puSetAttribute(locListView, PUA_LISTVIEW_TABLE, 0);
+                            puSetAttribute(locListView, PUA_LISTVIEW_TABLE, oldTable);
+                        }
+                        puDoMethod(locListView, PUM_CONTROL_RELAYOUT, 0, 0);
+                    }
+                    //ShowModalMessage(NULL, "Location added to your watch list.\nGo to the 'LocWatch' tab to see it.", "Copied", MB_OK);
+                    return TRUE;
+                }
+				case IDC_EXPORT_LIST_BTN: {
+                    // Ask user for a file name
+                    char filename[MAX_PATH] = "";
+                    OPENFILENAME ofn;
+                    ZeroMemory(&ofn, sizeof(ofn));
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = hDlg;
+                    ofn.lpstrFilter = "Text Files\0*.txt\0All Files\0*.*\0";
+                    ofn.lpstrFile = filename;
+                    ofn.nMaxFile = MAX_PATH;
+                    ofn.lpstrDefExt = "txt";
+                    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+                    
+                    if (!GetSaveFileName(&ofn))
+                        return TRUE; // cancelled
+
+                    // Open file
+                    FILE *fp = fopen(filename, "w");
+                    if (!fp) {
+                        char err[256];
+                        sprintf(err, "Cannot create file:\n%s", filename);
+                        ShowModalMessage(hDlg, err, "Export Error", MB_OK | MB_ICONERROR);
+                        return TRUE;
+                    }
+
+                    // Write header
+                    fprintf(fp, "Location Statistics exported from ClickSaver\n");
+                    fprintf(fp, "Date: %s\n\n", __DATE__);
+
+                    // Write each line from the listbox
+                    HWND hList = GetDlgItem(hDlg, IDC_LOC_STATS_LIST);
+                    if (hList) {
+                        int count = (int)SendMessage(hList, LB_GETCOUNT, 0, 0);
+                        for (int i = 0; i < count; i++) {
+                            char line[1024];
+                            SendMessageA(hList, LB_GETTEXT, i, (LPARAM)line);
+                            fprintf(fp, "%s\n", line);
+                        }
+                    }
+
+                    fclose(fp);
+
+                    char msg[256];
+                    sprintf(msg, "Exported %d location entries to:\n%s", 
+                            (int)SendMessage(hList, LB_GETCOUNT, 0, 0), filename);
+                    ShowModalMessage(hDlg, msg, "Export Complete", MB_OK);
+                    return TRUE;
+                }
+            
+            }
+            break;
+
+        case WM_CLOSE:
+            DestroyWindow(hDlg);
+            return TRUE;
+    }
+    return FALSE;
+}
+
 // ========== WINDOW SUBCLASS FOR TIMER HANDLING ==========
 LRESULT CALLBACK MainWndProcHook( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData )
 {
@@ -1698,6 +1776,95 @@ void ReleaseAODatabase(void)
 	if (g_stmtIcon) sqlite3_finalize(g_stmtIcon);
 	if (g_stmtPF)   sqlite3_finalize(g_stmtPF);
 	if (g_pSQLite)  sqlite3_close(g_pSQLite);
+}
+
+void addLocationStat(const char *pfName, int pfId, double x, double y) {
+    if (!pfName || !*pfName) return;
+    int rx = (int)(x / 100.0) * 100;
+    int ry = (int)(y / 100.0) * 100;
+    LocStat *cur = g_locStats;
+    while (cur) {
+        if (cur->pfId == pfId && cur->xc == rx && cur->yc == ry) {
+            cur->count++;
+            return;
+        }
+        cur = cur->next;
+    }
+    LocStat *newStat = (LocStat*)malloc(sizeof(LocStat));
+    if (newStat) {
+        strcpy(newStat->pfName, pfName);
+        newStat->pfId = pfId;
+        newStat->xc = rx;
+        newStat->yc = ry;
+        newStat->count = 1;
+        newStat->next = g_locStats;
+        g_locStats = newStat;
+    }
+}
+
+static void clearLocationStats(void) {
+    LocStat *cur = g_locStats;
+    while (cur) {
+        LocStat *next = cur->next;
+        free(cur);
+        cur = next;
+    }
+    g_locStats = NULL;
+}
+
+static void PopulateLocationStatsListbox(HWND hList) {
+    if (!hList) return;
+    SendMessage(hList, LB_RESETCONTENT, 0, 0);
+    
+    int count = 0;
+    LocStat *cur = g_locStats;
+    while (cur) { count++; cur = cur->next; }
+    if (count == 0) return;
+    
+    // Create array for sorting
+    LocStat **array = (LocStat**)malloc(count * sizeof(LocStat*));
+    if (!array) return;
+    cur = g_locStats;
+    int idx = 0;
+    while (cur) { array[idx++] = cur; cur = cur->next; }
+    
+    // Sort descending by count (bubble sort)
+    for (int i = 0; i < count-1; i++) {
+        for (int j = i+1; j < count; j++) {
+            if (array[i]->count < array[j]->count) {
+                LocStat *tmp = array[i];
+                array[i] = array[j];
+                array[j] = tmp;
+            }
+        }
+    }
+    
+    // Populate listbox with display strings and store pfId as item data
+    for (int i = 0; i < count; i++) {
+        int xmin = array[i]->xc - 50;
+        int xmax = array[i]->xc + 50;
+        int ymin = array[i]->yc - 50;
+        int ymax = array[i]->yc + 50;
+        char line[512];
+        sprintf(line, "%d) %s (%d-%d, %d-%d) (%d times)",
+                i+1, array[i]->pfName, xmin, xmax, ymin, ymax, array[i]->count);
+        int itemIndex = SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)line);
+        SendMessage(hList, LB_SETITEMDATA, itemIndex, (LPARAM)array[i]->pfId);
+    }
+    free(array);
+    
+    // Select first item
+    SendMessage(hList, LB_SETCURSEL, 0, 0);
+    
+    // Update total attempts static text
+    int totalMissions = 0;
+    cur = g_locStats;
+    while (cur) { totalMissions += cur->count; cur = cur->next; }
+    int totalAttempts = totalMissions / 5;
+    char totalBuf[256];
+    sprintf(totalBuf, "Total attempts: %d    (click any location, then press 'Copy Waypoint')", totalAttempts);
+    HWND hTotalStatic = GetDlgItem(GetParent(hList), IDC_TOTAL_STATS_TEXT);
+    if (hTotalStatic) SetWindowTextA(hTotalStatic, totalBuf);
 }
 
 int main( int argc, char** argv )
@@ -1883,6 +2050,8 @@ if (!LoadItemNameCache(cachePath)) {
         SendMessage( (HWND)uWindowHandle, WM_SETICON, ICON_BIG,   (LPARAM)hIcon );
         SendMessage( (HWND)uWindowHandle, WM_SETICON, ICON_SMALL, (LPARAM)hIcon );
     }
+	
+	InitDialogColors();
 
     do
     {
@@ -2071,7 +2240,8 @@ if (!LoadItemNameCache(cachePath)) {
                 puSetAttribute(puGetObjectFromCollection(g_pCol, CS_BA_PROGRESS), PUA_TEXT_STRING, (PUU32)"");
                 puSetAttribute(puGetObjectFromCollection(g_pCol, CS_BA_TOTAL), PUA_TEXT_STRING, (PUU32)"");
                 puSetAttribute(puGetObjectFromCollection(g_pCol, CS_BA_ACCEPTED), PUA_TEXT_STRING, (PUU32)"");
-                EndBuyingAgent();   // This will clear counters and set g_bBuyingAgentActive = 0
+                EndBuyingAgent();
+				clearLocationStats();
             break;
 			
         case CSAM_PAUSEBUYINGAGENT:
@@ -2103,6 +2273,44 @@ if (!LoadItemNameCache(cachePath)) {
                 }
             }
             break;
+			
+		case CSAM_SHOW_LOCATION_STATS:
+					{
+						if (!g_bBuyingAgentActive) {
+							ShowModalMessage(NULL, "Location tracking only available during a buying agent session.", "ClickSaver", MB_OK | MB_ICONINFORMATION);
+							break;
+						}
+						if (!g_locStats) {
+							ShowModalMessage(NULL, "No locations have been seen yet.", "ClickSaver", MB_OK | MB_ICONINFORMATION);
+							break;
+						}
+					
+						// If dialog already exists, refresh it
+						if (g_hLocStatsWnd && IsWindow(g_hLocStatsWnd)) {
+							SetForegroundWindow(g_hLocStatsWnd);
+							HWND hList = GetDlgItem(g_hLocStatsWnd, IDC_LOC_STATS_LIST);
+							if (hList) PopulateLocationStatsListbox(hList);
+							break;
+						}
+					
+						// Create the dialog modeless
+						HWND hParent = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
+						HWND hDlg = CreateDialogParam(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_LOCATION_STATS), hParent, LocStatsDialogProc, 0);
+						if (!hDlg) {
+							ShowModalMessage(NULL, "Failed to create dialog.", "Error", MB_OK);
+							break;
+						}
+						if (g_LocStatsX >= 0 && g_LocStatsY >= 0) {
+							SetWindowPos(hDlg, NULL, g_LocStatsX, g_LocStatsY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+						}
+						g_hLocStatsWnd = hDlg;
+					
+						HWND hList = GetDlgItem(hDlg, IDC_LOC_STATS_LIST);
+						if (hList) PopulateLocationStatsListbox(hList);
+					
+						ShowWindow(hDlg, SW_SHOW);
+						break;
+					}
 
         case CSAM_BUYINGAGENT_TIMER:
             // Timer expired – send the click if not paused
@@ -2406,6 +2614,7 @@ if (!LoadItemNameCache(cachePath)) {
                 if( bReadyToGo )
                 {
                     ClearItemCounters();
+					clearLocationStats();
                     g_bBuyingAgentActive = 1;
 					g_bPaused = 0; 
 					
@@ -2571,7 +2780,6 @@ if (!LoadItemNameCache(cachePath)) {
     return 0;
 }
 
-
 void CleanUp()
 {
     if (g_hThreadExitEvent != NULL) {
@@ -2599,12 +2807,12 @@ void CleanUp()
     }
 	
 	ReleaseAODatabase();
+	FreeDialogColors();
 
     puDeleteObjectCollection( g_pCol );
     puClear();
 	FreeItemNameCache();
 }
-
 
 enum
 {
@@ -2642,6 +2850,8 @@ enum
     CFG_ITEMOPTIONAL,
 	CFG_BAWINDOWX,
     CFG_BAWINDOWY,
+	CFG_LOCSTATSX,
+	CFG_LOCSTATSY,
 };
 
 
@@ -2686,6 +2896,8 @@ struct
     { CFG_ITEMOPTIONAL, "ITEMOPTIONAL" },
 	{ CFG_BAWINDOWX, "BAWINDOWX" },
     { CFG_BAWINDOWY, "BAWINDOWY" },
+	{ CFG_LOCSTATSX, "LOCSTATSX" },
+	{ CFG_LOCSTATSY, "LOCSTATSY" },
     { 0, NULL }
 };
 
@@ -2926,7 +3138,14 @@ void ImportSettings( char* filename )
 				puDoMethod( g_DisabledItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)tableEntry, 0 );
 			}
 			break;
-
+			
+		case CFG_LOCSTATSX:
+			sscanf(Value, "%d", &g_LocStatsX);
+			break;
+		case CFG_LOCSTATSY:
+			sscanf(Value, "%d", &g_LocStatsY);
+			break;
+			
         case ISM_ITEMWATCH:
         case ISM_LOCWATCH:
             pString = buffer + strlen( buffer );
@@ -3047,6 +3266,9 @@ void ExportSettings( char* filename )
              puGetAttribute( puGetObjectFromCollection( g_pCol, CS_ITEMVALUE_TOTAL ), PUA_TEXTENTRY_VALUE ),
              puGetAttribute( puGetObjectFromCollection( g_pCol, CS_ITEMVALUE_MSINGLE ), PUA_CHECKBOX_CHECKED ),
              puGetAttribute( puGetObjectFromCollection( g_pCol, CS_ITEMVALUE_MTOTAL ), PUA_CHECKBOX_CHECKED ) );
+
+	fprintf(fp, "LOCSTATSX::%d\n", g_LocStatsX);
+	fprintf(fp, "LOCSTATSY::%d\n", g_LocStatsY);
 
     fprintf( fp, "::ItemWatch::\n" );
 	Record = puDoMethod( g_ItemWatchList, PUM_TABLE_GETFIRSTRECORD, 0, 0 );
@@ -3195,6 +3417,7 @@ int BuyingAgent( int delay )
 void EndBuyingAgent()
 {
     g_bBuyingAgentActive = 0;
+	clearLocationStats();
 	g_bPaused = 0; 
     ClearItemCounters();
 	

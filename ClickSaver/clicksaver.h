@@ -149,6 +149,7 @@ enum
 
     CSAM_SET_SLIDERS,
     CSAM_PAUSEBUYINGAGENT,
+	CSAM_SHOW_LOCATION_STATS,
     CSAM_UPDATE_DELAY,
 
     CSAM_BUYINGAGENT_TIMER,
@@ -177,6 +178,8 @@ extern PULID g_MainWin;
 extern PUU8 g_MishNumber, g_FoundMish;
 extern PUU8 g_bFullscreen;
 extern PUU32 g_GUIDef[];
+extern PUU8 g_bBuyingAgentActive;
+void addLocationStat(const char *pfName, int pfId, double x, double y);
 int IsWatchlistEntryValid(const char *searchStr);
 int GetMatchingItems(const char *searchStr, const char ***outItems, int *outCount);
 int GetFilteredMatchingItems(const char *baseName, const char *excludeWords, const char ***outItems, int *outCount);
