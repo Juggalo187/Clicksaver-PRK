@@ -28,8 +28,21 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "ClickSaver.h"
 #include "excluded_items.h"
 
+static void BuildItemIndex(void);
+static int FindItemInDescriptionFromCache(const PUU8* desc, unsigned long descLen, PUU8* outName);
+
 static char **g_itemNames = NULL;
 static size_t g_numItemNames = 0;
+
+typedef struct ItemIndexEntry {
+    char* firstWord;
+    const char** items;
+    int count;
+} ItemIndexEntry;
+
+static ItemIndexEntry* g_itemIndex = NULL;
+static int g_itemIndexSize = 0;
+
 static PUU8 g_bIsFindItem = 0;
 static PUU8 g_bIsReturnMission = 0;
 static PUU32 g_bRewardMatched = 0;
@@ -160,13 +173,12 @@ static int is_duplicate(const char *name, char **seen, int *seen_count) {
     return 0;
 }
 
-static int ShouldSkipItemName(const char *name) {
+int ShouldSkipItemName(const char *name) {
     if (!name || !*name) return 1;
 
     // List of substrings to exclude (case-insensitive)
     const char *skip_patterns[] = {
         "Photon Particle Emitter",
-        "Hacked",
         "Compiled Algorithm",
         "Instruction Disc",
         "Weird Looking",
@@ -244,6 +256,19 @@ static int ShouldSkipItemName(const char *name) {
         return 1;
 	
     return 0; // keep item
+}
+
+static void NormalizeString(const char* src, char* dst, size_t dstSize) {
+    size_t i = 0;
+    while (*src && i < dstSize - 1) {
+        char c = *src++;
+        // Convert to lowercase
+        if (c >= 'A' && c <= 'Z') c += 32;
+        // Remove apostrophes (both straight and curly)
+        if (c == '\'' || c == '’') continue;
+        dst[i++] = c;
+    }
+    dst[i] = '\0';
 }
 
 void BuildItemNameCache(const char *filename) {
@@ -365,8 +390,85 @@ int LoadItemNameCache(const char *cacheFilePath) {
     // Sort for binary search
     qsort(g_itemNames, g_numItemNames, sizeof(char*),
           (int(*)(const void*, const void*))strcmp);
+		  
+		  BuildItemIndex();
 
     return 1;
+}
+
+static void BuildItemIndex(void) {
+    if (!g_itemNames || g_numItemNames == 0) return;
+    
+    // Free existing index if any
+    for (int i = 0; i < g_itemIndexSize; i++) {
+        free(g_itemIndex[i].firstWord);
+        free((void*)g_itemIndex[i].items); // items is const char**, but we allocated it
+    }
+    free(g_itemIndex);
+    g_itemIndex = NULL;
+    g_itemIndexSize = 0;
+    
+    // Use a temporary hash map (simple array of buckets with linear search for small count)
+    // We'll just build a list and sort later for simplicity.
+    struct TempEntry {
+        char* firstWord;
+        const char** items;
+        int count;
+        int capacity;
+    } *temp = NULL;
+    int tempSize = 0;
+    
+    for (size_t i = 0; i < g_numItemNames; i++) {
+        const char* fullName = g_itemNames[i];
+        // Extract first word (up to first space)
+        char firstWord[256];
+        const char* p = fullName;
+        size_t wlen = 0;
+        while (*p && *p != ' ' && wlen < sizeof(firstWord)-1) {
+            firstWord[wlen++] = *p++;
+        }
+        firstWord[wlen] = '\0';
+        // Normalize first word (lowercase, remove apostrophes)
+        char normFirst[256];
+        NormalizeString(firstWord, normFirst, sizeof(normFirst));
+        if (normFirst[0] == '\0') continue;
+        
+        // Find or create temp entry
+        int idx = -1;
+        for (int j = 0; j < tempSize; j++) {
+            if (strcmp(temp[j].firstWord, normFirst) == 0) {
+                idx = j;
+                break;
+            }
+        }
+        if (idx == -1) {
+            // Add new entry
+            temp = realloc(temp, (tempSize+1) * sizeof(struct TempEntry));
+            temp[tempSize].firstWord = _strdup(normFirst);
+            temp[tempSize].items = NULL;
+            temp[tempSize].count = 0;
+            temp[tempSize].capacity = 0;
+            idx = tempSize;
+            tempSize++;
+        }
+        // Add item to list
+        struct TempEntry* e = &temp[idx];
+        if (e->count >= e->capacity) {
+            e->capacity = e->capacity ? e->capacity * 2 : 4;
+            e->items = realloc((void*)e->items, e->capacity * sizeof(const char*));
+        }
+        e->items[e->count++] = fullName;
+    }
+    
+    // Convert to final index array
+    g_itemIndexSize = tempSize;
+    g_itemIndex = malloc(g_itemIndexSize * sizeof(ItemIndexEntry));
+    for (int i = 0; i < tempSize; i++) {
+        g_itemIndex[i].firstWord = temp[i].firstWord;
+        g_itemIndex[i].items = temp[i].items;
+        g_itemIndex[i].count = temp[i].count;
+    }
+    free(temp);
 }
 
 void FreeItemNameCache(void) {
@@ -376,6 +478,15 @@ void FreeItemNameCache(void) {
     free(g_itemNames);
     g_itemNames = NULL;
     g_numItemNames = 0;
+	
+	// Free index
+    for (int i = 0; i < g_itemIndexSize; i++) {
+        free(g_itemIndex[i].firstWord);
+        free((void*)g_itemIndex[i].items);
+    }
+    free(g_itemIndex);
+    g_itemIndex = NULL;
+    g_itemIndexSize = 0;
 }
 
 static int IsRealItemNameCI(const char *name) {
@@ -2414,9 +2525,71 @@ static long FindSubstringCI(const PUU8* haystack, unsigned long haystackLen, con
     return -1;
 }
 
+static int FindItemInDescriptionFromCache(const PUU8* desc, unsigned long descLen, PUU8* outName) {
+    if (!g_itemIndex || g_itemIndexSize == 0) return 0;
+    
+    // Normalize the entire description (convert to lowercase, remove apostrophes)
+    char* normDesc = malloc(descLen + 1);
+    if (!normDesc) return 0;
+    NormalizeString((const char*)desc, normDesc, descLen + 1);
+    
+    // Tokenize description into words (split by spaces/punctuation)
+    char* words[1024];
+    int wordCount = 0;
+    char* token;
+	char* context = NULL;
+	token = strtok_s(normDesc, " .,!?;:\t\n\r", &context);
+	while (token && wordCount < 1024) {
+		words[wordCount++] = token;
+		token = strtok_s(NULL, " .,!?;:\t\n\r", &context);
+	}
+    
+    // For each word, look up items starting with that word
+    const char* bestMatch = NULL;
+    int bestLen = 0;
+    
+    for (int i = 0; i < wordCount; i++) {
+        // Find index entries matching this word
+        for (int j = 0; j < g_itemIndexSize; j++) {
+            if (strcmp(words[i], g_itemIndex[j].firstWord) != 0) continue;
+            // Check each item in this bucket
+            for (int k = 0; k < g_itemIndex[j].count; k++) {
+                const char* item = g_itemIndex[j].items[k];
+                // Normalized version of item? We'll do substring search in normalized desc
+                char normItem[512];
+                NormalizeString(item, normItem, sizeof(normItem));
+                if (strstr(normDesc, normItem) != NULL) {
+                    int len = strlen(item);
+                    if (len > bestLen) {
+                        bestLen = len;
+                        bestMatch = item;
+                    }
+                }
+            }
+        }
+    }
+    
+    free(normDesc);
+    
+    if (bestMatch) {
+        strncpy((char*)outName, bestMatch, 255);
+        outName[255] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
 // Main extraction function
 PUU32 MissionFind(PUU8* _pMissionDesc, PUU32 _DescLen, PUU8* _pItemName)
 {
+    // First, try to find item from cache (most reliable)
+    if (FindItemInDescriptionFromCache(_pMissionDesc, _DescLen, _pItemName)) {
+        // Extra validation: ensure it's not a filtered item (optional)
+        if (!ShouldSkipItemName((const char*)_pItemName)) {
+            return TRUE;
+        }
+    }
+	
     // Safety: convert to char pointers for easier arithmetic
     const char* desc = (const char*)_pMissionDesc;
     const char* descEnd = desc + _DescLen;

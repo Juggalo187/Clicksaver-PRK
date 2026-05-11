@@ -15389,6 +15389,7 @@ const char *g_excluded_items[] = {
     "Birthday Cake (Replica)",
     "Adventurers' Campfire",
     "Omni-Tek Organization Registration Terminal",
+    "Weird-Looking Bomb",
     "Clan",
     "Neutral",
     "Omni-Tek",
