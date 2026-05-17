@@ -999,6 +999,7 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
     PUU32 bItemNameMatch = FALSE;    // watchlist name matched
     PUU32 bValueMatch = FALSE;       // any value threshold exceeded
     PUU32 bLocFound = FALSE, bTypeFound = FALSE;
+	int bExitFound = 0;  
     PUU32 Count = 65536 - 4, DescLength;
     PUU8* pEndMissionData;
     PUU8* pDesc;
@@ -1102,19 +1103,25 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
         puSetAttribute( puGetObjectFromCollection( _pData->pCol, MISHXP ), PUA_TEXT_STRING, (PUU32)_pData->XPStr );
     }
 
-    // Playfield and coordinates
-	CHECK_BOUNDS(_pMissionData, 0xbc + 4);
-    MishPF = EndianSwap32( *(PUU32*)(_pMissionData + 0xA8) );
-    MissionPF( MishPF, PFName );
-    TempVal = EndianSwap32( *(PUU32*)(_pMissionData + 0xb4) );
-    *(PUU32*)(&CoordX) = TempVal;
-    TempVal = EndianSwap32( *(PUU32*)(_pMissionData + 0xbc) );
-    *(PUU32*)(&CoordY) = TempVal;
-    snprintf(TempStr, sizeof(TempStr), "%s (%.1f, %.1f)", PFName, CoordX, CoordY);
-    if (g_bBuyingAgentActive) {
-		addLocationStat(PFName, MishPF, CoordX, CoordY);
-	}
-    bLocFound = SetAndSearch( TempStr, puGetObjectFromCollection( _pData->pCol, LOCATION ), g_LocWatchList );
+	// Playfield and coordinates
+		CHECK_BOUNDS(_pMissionData, 0xbc + 4);
+		MishPF = EndianSwap32( *(PUU32*)(_pMissionData + 0xA8) );
+		MissionPF( MishPF, PFName );
+		TempVal = EndianSwap32( *(PUU32*)(_pMissionData + 0xb4) );
+		*(PUU32*)(&CoordX) = TempVal;
+		TempVal = EndianSwap32( *(PUU32*)(_pMissionData + 0xbc) );
+		*(PUU32*)(&CoordY) = TempVal;
+		snprintf(TempStr, sizeof(TempStr), "%s (%.1f, %.1f)", PFName, CoordX, CoordY);
+		if (g_bBuyingAgentActive) {
+			addLocationStat(PFName, MishPF, CoordX, CoordY);
+		}
+		bExitFound = CheckMissionNearExit(MishPF, CoordX, CoordY);
+		bLocFound = SetAndSearch( TempStr, puGetObjectFromCollection( _pData->pCol, LOCATION ), g_LocWatchList );
+		
+		// After SetAndSearch, re-apply exit highlight if it should be highlighted
+		if (bExitFound && puGetAttribute(puGetObjectFromCollection(g_pCol, CS_HIGHLIGHTEXIT_CB), PUA_CHECKBOX_CHECKED)) {
+			puSetAttribute(puGetObjectFromCollection(_pData->pCol, LOCATION), PUA_TEXTENTRY_HILIGHT, TRUE);
+		}
 
     // Mission type
 	CHECK_BOUNDS(_pMissionData, 0x28 + 4);
@@ -1181,28 +1188,31 @@ PUU32 MissionParse( PULID _Object, MissionClassData* _pData, PUU8* _pMissionData
     }
 	
         // If any override item (starting with '~') was found, accept immediately
-    if( g_bOverrideMatch ) {
-        bAccept = 1;
-    } else {
-        // ---- NEW LOGIC for optional item name (Behavior B) ----
-        PUU32 bItemOptional = puGetAttribute( puGetObjectFromCollection( g_pCol, CS_ITEMOPTIONAL_CB ), PUA_CHECKBOX_CHECKED );
-        PUU32 bNonItemActive = bAlertLoc || bAlertType || PUL_GET_CB(CS_ITEMVALUE_MSINGLE) || PUL_GET_CB(CS_ITEMVALUE_MTOTAL);
-
-        if( bItemOptional && bNonItemActive ) {
-            bAccept = 1;
-            if( bAlertLoc && !bLocFound ) bAccept = 0;
-            if( bAlertType && !bTypeFound ) bAccept = 0;
-            if( (PUL_GET_CB(CS_ITEMVALUE_MSINGLE) || PUL_GET_CB(CS_ITEMVALUE_MTOTAL)) && !bValueMatch ) bAccept = 0;
-        } else {
-            bAccept = bAlertItem || bAlertLoc || bAlertType;
-            if( bAlertItem ) bAccept = bAccept && bItemNameMatch;
-            if( bAlertLoc )  bAccept = bAccept && bLocFound;
-            if( bAlertType ) bAccept = bAccept && bTypeFound;
-            if( PUL_GET_CB(CS_ITEMVALUE_MSINGLE) || PUL_GET_CB(CS_ITEMVALUE_MTOTAL) )
-                bAccept = bAccept && bValueMatch;
-        }
-    }
-			
+		if( g_bOverrideMatch ) {
+			bAccept = 1;
+		} else {
+			// ---- NEW LOGIC for optional item name (Behavior B) ----
+			PUU32 bItemOptional = puGetAttribute( puGetObjectFromCollection( g_pCol, CS_ITEMOPTIONAL_CB ), PUA_CHECKBOX_CHECKED );
+			// Include exit in the non‑item active criteria
+			PUU32 bNonItemActive = bAlertLoc || bAlertType || PUL_GET_CB(CS_ITEMVALUE_MSINGLE) || PUL_GET_CB(CS_ITEMVALUE_MTOTAL) || (bExitFound && PUL_GET_CB(CS_ALERTEXIT_CB));
+		
+			if( bItemOptional && bNonItemActive ) {
+				bAccept = 1;
+				if( bAlertLoc && !bLocFound ) bAccept = 0;
+				if( bAlertType && !bTypeFound ) bAccept = 0;
+				if( (PUL_GET_CB(CS_ITEMVALUE_MSINGLE) || PUL_GET_CB(CS_ITEMVALUE_MTOTAL)) && !bValueMatch ) bAccept = 0;
+				if( PUL_GET_CB(CS_ALERTEXIT_CB) && !bExitFound ) bAccept = 0;
+			} else {
+				bAccept = bAlertItem || bAlertLoc || bAlertType || (bExitFound && PUL_GET_CB(CS_ALERTEXIT_CB));
+				if( bAlertItem ) bAccept = bAccept && bItemNameMatch;
+				if( bAlertLoc )  bAccept = bAccept && bLocFound;
+				if( bAlertType ) bAccept = bAccept && bTypeFound;
+				if( PUL_GET_CB(CS_ITEMVALUE_MSINGLE) || PUL_GET_CB(CS_ITEMVALUE_MTOTAL) )
+					bAccept = bAccept && bValueMatch;
+				if( PUL_GET_CB(CS_ALERTEXIT_CB) )
+					bAccept = bAccept && bExitFound;
+			}
+		}
 	        LogMissionDescription(TempVal, TempStr, pDesc, DescLength);
 
     if( bAccept ) {

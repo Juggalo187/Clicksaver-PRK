@@ -111,6 +111,20 @@ enum
     CS_ITEM_ADD_BTN,
     CS_ITEM_EDIT_BTN,
 
+	CS_EXITS_TAB,
+	CS_EXITS_LISTVIEW,
+	CS_EXITS_LIST,
+	CS_EXITS_CLAN_CB,
+	CS_EXITS_NEUTRAL_CB,
+	CS_EXITS_OMNI_CB,
+	CS_EXITS_GRID_CLAN_CB,
+	CS_EXITS_GRID_NEUTRAL_CB,
+	CS_EXITS_GRID_OMNI_CB,
+	CS_EXITS_RADIUS_SLIDER,
+	CS_EXITS_RADIUS_BTN,
+	CS_ALERTEXIT_CB,
+	CS_HIGHLIGHTEXIT_CB,
+
     CS_WATCH_MSGBOX,
 
     CS_DBCOPYMSGBOX,
@@ -159,6 +173,7 @@ enum
     CSAM_ITEM_EDIT_OK,
     CSAM_ITEM_ADD_OK,
     CSAM_ITEM_EDIT_CANCEL,
+	CSAM_UPDATE_EXIT_RADIUS,
 
     CSAM_DISABLE_ITEM,
     CSAM_ENABLE_ITEM,
@@ -172,6 +187,7 @@ enum
 
 // External variables
 extern PULID g_ItemWatchList;
+extern int g_ExitProximityRadius;
 extern PULID g_LocWatchList;
 extern PULID g_TypeWatchList;
 extern pusObjectCollection* g_pCol;
@@ -187,7 +203,7 @@ void safe_strcat(char *dest, size_t dest_size, const char *src);
 int IsWatchlistEntryValid(const char *searchStr);
 int GetMatchingItems(const char *searchStr, const char ***outItems, int *outCount);
 int GetFilteredMatchingItems(const char *baseName, const char *excludeWords, const char ***outItems, int *outCount);
-
+int CheckMissionNearExit(int zoneId, float x, float y);
 
 // Endianness macros
 #define EndianSwap16(x) ( ( x ) >> 8 | ( x ) << 8 )

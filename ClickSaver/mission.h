@@ -49,6 +49,7 @@ typedef struct
     PUU32   Value;
     PUU32   QL;
     PUU32   IconKey;
+	PUU32   NoDrop;
 } MissionItem;
 
 typedef struct

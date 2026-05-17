@@ -70,6 +70,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <shlobj.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include <commctrl.h>
 #include <windowsx.h>
 #include "clicksaver.h"
@@ -159,6 +160,113 @@ static HBRUSH g_hDialogBgBrush = NULL;   // RGB(170,170,170)
 static HBRUSH g_hButtonBgBrush = NULL;   // RGB(112,143,166)
 
 static const char* const PROP_BUTTON_IDS = "ClickSaver_OwnerDrawButtons";
+
+// ========== Exits data ==========
+typedef struct {
+    char type[16];
+    char name[128];
+    int zoneId;
+    float x, y;
+    int group;  // 0=Clan, 1=Neutral, 2=Omni, 3=Grid
+} ExitLocation;
+
+static ExitLocation g_Exits[] = {
+    // Whompahs (Neutral)
+    {"Whompah", "Newland City", 566, 384.6f, 303.5f, 1},
+    {"Whompah", "Stolt's Trading Outpost", 565, 2195.3f, 1565.7f, 1},
+    {"Whompah", "Earsnest Wastelands", 560, 2891.4f, 1910.2f, 1},
+    {"Whompah", "East Last Ditch", 790, 1275.4f, 2883.5f, 1},
+    {"Whompah", "Borealis", 800, 682.6f, 539.4f, 1},
+    {"Whompah", "Nepal", 655, 3238.7f, 900.0f, 1},
+    // Whompahs (Omni)
+    {"Whompah", "Trade District", 710, 341.7f, 382.3f, 2},
+    {"Whompah", "Galway Castle Area", 685, 2528.5f, 1185.8f, 2},
+    {"Whompah", "Outpost 10-3", 610, 1151.2f, 2346.4f, 2},
+    {"Whompah", "2HO Outpost", 635, 791.6f, 1613.1f, 2},
+    {"Whompah", "Omni Tek mine", 795, 2063.4f, 723.2f, 2},
+    {"Whompah", "4Holes", 760, 1217.8f, 1230.9f, 2},
+    {"Whompah", "Central Meadows", 630, 1245.9f, 2301.9f, 2},
+    {"Whompah", "The Eastofhomes", 665, 2330.2f, 2259.2f, 2},
+    {"Whompah", "Rome Park Area", 730, 353.8f, 323.0f, 2},
+    {"Whompah", "Omni-1 Entertainment, East", 705, 885.9f, 470.0f, 2},
+    {"Whompah", "Infestation", 696, 334.2f, 1335.4f, 2},
+    // Whompahs (Clan)
+    {"Whompah", "Tir City", 640, 630.0f, 338.6f, 0},
+    {"Whompah", "Varmint Woods Swampland", 600, 2488.0f, 2104.3f, 0},
+    {"Whompah", "Hollow Mountain", 605, 2150.8f, 2321.2f, 0},
+    {"Whompah", "Duhndur Wastes", 551, 1361.1f, 1738.8f, 0},
+    {"Whompah", "Old Athen East", 540, 462.9f, 309.2f, 0},
+    {"Whompah", "Bliss", 795, 3712.1f, 1604.8f, 0},
+    {"Whompah", "Mountains of Four Lakes", 665, 1001.0f, 3760.6f, 0},
+    {"Whompah", "Camelot", 505, 2165.7f, 3820.7f, 0},
+	// Grid Exits (Clan)
+	{"Grid", "Tir City", 640, 544.9f, 536.3f, 3},
+	{"Grid", "Old Athen East", 540, 515.4f, 565.6f, 3},
+	{"Grid", "West Athen", 545, 473.3f, 408.9f, 3},
+	{"Grid", "Camelot", 505, 2064.4f, 3760.4f, 3},
+	// Grid Exits (Neutral)
+	{"Grid", "Newland City", 567, 1161.8f, 481.6f, 4},
+	{"Grid", "Borealis", 800, 634.5f, 723.8f, 4},
+	{"Grid", "Meetmedere", 565, 1529.5f, 2724.4f, 4},
+	{"Grid", "Coast of Peace", 556, 2800.0f, 1067.5f, 4},
+	{"Grid", "Coast of Tranquility", 656, 1577.9f, 1645.6f, 4},
+	{"Grid", "The City of Home - East", 665, 647.5f, 1315.4f, 4},
+	{"Grid", "Clondyke", 670, 1054.2f, 4033.5f, 4},
+	{"Grid", "Harry's", 695, 3125.1f, 3176.1f, 4},
+	{"Grid", "Mort Crater (Sentinels)", 560, 1939.9f, 1253.9f, 4},
+	// Grid Exits (Omni)
+	{"Grid", "Galway - Area Y", 685, 1419.8f, 1086.6f, 5},
+	{"Grid", "Lush Hills - South Fields", 695, 1453.5f, 665.7f, 5},
+	{"Grid", "Omni-1 Entertainment, South", 705, 582.0f, 330.0f, 5},
+	{"Grid", "Rome Park Area", 730, 258.1f, 317.9f, 5},
+	{"Grid", "2HO Outpost", 635, 668.1f, 1648.5f, 5},
+	{"Grid", "4Holes", 760, 870.8f, 1606.5f, 5},
+	{"Grid", "Omni-1 Headquarters", 700, 603.6f, 474.0f, 5},
+	
+	
+};
+
+static int g_NumExits = sizeof(g_Exits) / sizeof(g_Exits[0]);
+int g_ExitProximityRadius = 200;
+
+static int IsMissionNearCheckedExit(int zoneId, float mx, float my, int radius)
+{
+    if (!puGetAttribute(puGetObjectFromCollection(g_pCol, CS_ALERTEXIT_CB), PUA_CHECKBOX_CHECKED))
+        return 0;
+
+    int useClanWhomp    = puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_CLAN_CB), PUA_CHECKBOX_CHECKED);
+    int useNeutralWhomp = puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_NEUTRAL_CB), PUA_CHECKBOX_CHECKED);
+    int useOmniWhomp    = puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_OMNI_CB), PUA_CHECKBOX_CHECKED);
+    int useClanGrid     = puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_GRID_CLAN_CB), PUA_CHECKBOX_CHECKED);
+    int useNeutralGrid  = puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_GRID_NEUTRAL_CB), PUA_CHECKBOX_CHECKED);
+    int useOmniGrid     = puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_GRID_OMNI_CB), PUA_CHECKBOX_CHECKED);
+
+    for (int i = 0; i < g_NumExits; i++) {
+        int groupEnabled = 0;
+        switch (g_Exits[i].group) {
+            case 0: groupEnabled = useClanWhomp; break;
+            case 1: groupEnabled = useNeutralWhomp; break;
+            case 2: groupEnabled = useOmniWhomp; break;
+            case 3: groupEnabled = useClanGrid; break;
+            case 4: groupEnabled = useNeutralGrid; break;
+            case 5: groupEnabled = useOmniGrid; break;
+        }
+        if (!groupEnabled) continue;
+
+        if (g_Exits[i].zoneId == zoneId) {
+            float dx = g_Exits[i].x - mx;
+            float dy = g_Exits[i].y - my;
+            float dist = sqrtf(dx*dx + dy*dy);
+            if (dist <= (float)radius) return 1;
+        }
+    }
+    return 0;
+}
+
+int CheckMissionNearExit(int zoneId, float x, float y)
+{
+    return IsMissionNearCheckedExit(zoneId, x, y, g_ExitProximityRadius);
+}
 
 void InitDialogColors(void) {
     if (!g_hDialogBgBrush)
@@ -2154,6 +2262,9 @@ if (!LoadItemNameCache(cachePath)) {
     MissionControls[ 4 ] = puGetObjectFromCollection( g_pCol, CS_MISSION5 );
     //puSetAttribute( puGetObjectFromCollection( g_pCol, CS_OPTIONSFOLD3 ), PUA_FOLD_FOLDED, TRUE);
     puSetAttribute( g_MainWin, PUA_WINDOW_OPENED, TRUE );
+	
+	PULID radiusEntry = puGetObjectFromCollection(g_pCol, CS_EXITS_RADIUS_SLIDER);
+	if (radiusEntry) puSetAttribute(radiusEntry, PUA_TEXTENTRY_VALUE, g_ExitProximityRadius);
 
     // Subclass the main window to catch WM_TIMER
     HWND hMainWnd = (HWND)puGetAttribute( g_MainWin, PUA_WINDOW_HANDLE );
@@ -2443,7 +2554,7 @@ if (!LoadItemNameCache(cachePath)) {
 				break;
 			}
 			
-			case CSAM_EXPORT_LOCATIONS:
+		case CSAM_EXPORT_LOCATIONS:
 			{
 				char filename[MAX_PATH];
 				HWND hMainWnd = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
@@ -2453,6 +2564,16 @@ if (!LoadItemNameCache(cachePath)) {
 					sprintf(msg, "Exported %d locations.",
 							puGetAttribute(g_LocWatchList, PUA_TABLE_NUMRECORDS));
 					ShowModalMessage(hMainWnd, msg, "Export Complete", MB_OK);
+				}
+				break;
+			}
+		case CSAM_UPDATE_EXIT_RADIUS:
+			{
+				PULID radiusEntry = puGetObjectFromCollection(g_pCol, CS_EXITS_RADIUS_SLIDER);
+				if (radiusEntry) {
+					int newRadius = puGetAttribute(radiusEntry, PUA_TEXTENTRY_VALUE);
+					if (newRadius >= 0 && newRadius <= 5000)
+						g_ExitProximityRadius = newRadius;
 				}
 				break;
 			}
@@ -2711,7 +2832,7 @@ if (!LoadItemNameCache(cachePath)) {
 									MessageBox( NULL, msg, "ClickSaver", MB_OK | MB_ICONINFORMATION | MB_SYSTEMMODAL );
 									
 									//skuly test
-									HWND hParent = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
+									/* HWND hParent = (HWND)puGetAttribute(g_MainWin, PUA_WINDOW_HANDLE);
 										HWND hDlg = CreateDialogParam(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_LOCATION_STATS), hParent, LocStatsDialogProc, 0);
 										if (g_LocStatsX >= 0 && g_LocStatsY >= 0) {
 											SetWindowPos(hDlg, NULL, g_LocStatsX, g_LocStatsY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
@@ -2721,7 +2842,7 @@ if (!LoadItemNameCache(cachePath)) {
 										HWND hList = GetDlgItem(hDlg, IDC_LOC_STATS_LIST);
 										if (hList) PopulateLocationStatsListbox(hList);
 									
-										ShowWindow(hDlg, SW_SHOW);
+										ShowWindow(hDlg, SW_SHOW); */
 									EndBuyingAgent();
 									g_BuyingAgentCount = 0;
 								}
@@ -3059,7 +3180,6 @@ struct
     { 0, NULL }
 };
 
-
 void ImportSettings( char* filename )
 {
     FILE* fp;
@@ -3130,7 +3250,7 @@ void ImportSettings( char* filename )
                     }
                     i++;
                 }
-
+				
                 switch( Id )
                 {
 				case CFG_AODIR:
@@ -3259,6 +3379,12 @@ void ImportSettings( char* filename )
 						g_BuyingAgentDelay = Val;
 					}
 					break;
+				case CFG_LOCSTATSX:
+					sscanf(Value, "%d", &g_LocStatsX);
+					break;
+				case CFG_LOCSTATSY:
+					sscanf(Value, "%d", &g_LocStatsY);
+					break;
                 case CFG_ITEMVALUE:
                 {
                     PUU32 a, b, c, d;
@@ -3270,8 +3396,41 @@ void ImportSettings( char* filename )
                     break;
                 }
                 }
-            }
-            break;
+				 if (strcmp(Keyword, "EXIT_RADIUS") == 0) {
+					sscanf(Value, "%d", &g_ExitProximityRadius);
+				}
+					else if (strcmp(Keyword, "EXIT_CLAN") == 0) {
+							int val; sscanf(Value, "%d", &val);
+							puSetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_CLAN_CB), PUA_CHECKBOX_CHECKED, val);
+						}
+					else if (strcmp(Keyword, "EXIT_NEUTRAL") == 0) {
+							int val; sscanf(Value, "%d", &val);
+							puSetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_NEUTRAL_CB), PUA_CHECKBOX_CHECKED, val);
+						}
+					else if (strcmp(Keyword, "EXIT_OMNI") == 0) {
+							int val; sscanf(Value, "%d", &val);
+							puSetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_OMNI_CB), PUA_CHECKBOX_CHECKED, val);
+						}
+					else if (strcmp(Keyword, "EXIT_GRID_CLAN") == 0) {
+						int val; sscanf(Value, "%d", &val);
+						puSetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_GRID_CLAN_CB), PUA_CHECKBOX_CHECKED, val);
+					} else if (strcmp(Keyword, "EXIT_GRID_NEUTRAL") == 0) {
+						int val; sscanf(Value, "%d", &val);
+						puSetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_GRID_NEUTRAL_CB), PUA_CHECKBOX_CHECKED, val);
+					} else if (strcmp(Keyword, "EXIT_GRID_OMNI") == 0) {
+						int val; sscanf(Value, "%d", &val);
+						puSetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_GRID_OMNI_CB), PUA_CHECKBOX_CHECKED, val);
+					}
+					else if (strcmp(Keyword, "EXIT_ALERT") == 0) {
+						int val; sscanf(Value, "%d", &val);
+						puSetAttribute(puGetObjectFromCollection(g_pCol, CS_ALERTEXIT_CB), PUA_CHECKBOX_CHECKED, val);
+					}
+					else if (strcmp(Keyword, "EXIT_HIGHLIGHT") == 0) {
+						int val; sscanf(Value, "%d", &val);
+						puSetAttribute(puGetObjectFromCollection(g_pCol, CS_HIGHLIGHTEXIT_CB), PUA_CHECKBOX_CHECKED, val);
+					}
+			}
+			break;
 
 		case ISM_DISABLED_ITEMWATCH:
 			pString = buffer + strlen( buffer );
@@ -3295,13 +3454,6 @@ void ImportSettings( char* filename )
 				puDoMethod( g_DisabledItemWatchList, PUM_TABLE_ADDRECORD, 0, 0 );
 				puDoMethod( g_DisabledItemWatchList, PUM_TABLE_SETFIELDVAL, (PUU32)tableEntry, 0 );
 			}
-			break;
-			
-		case CFG_LOCSTATSX:
-			sscanf(Value, "%d", &g_LocStatsX);
-			break;
-		case CFG_LOCSTATSY:
-			sscanf(Value, "%d", &g_LocStatsY);
 			break;
 			
         case ISM_ITEMWATCH:
@@ -3340,7 +3492,6 @@ void ImportSettings( char* filename )
 
     fclose( fp );
 }
-
 
 void ExportSettings( char* filename )
 {
@@ -3422,6 +3573,17 @@ void ExportSettings( char* filename )
 		}
 	}
 	fprintf(fp, "BAWINDOWX::%d\nBAWINDOWY::%d\n", g_BAWindowX, g_BAWindowY);
+	
+	fprintf(fp, "EXIT_CLAN::%d\n", puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_CLAN_CB), PUA_CHECKBOX_CHECKED));
+	fprintf(fp, "EXIT_NEUTRAL::%d\n", puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_NEUTRAL_CB), PUA_CHECKBOX_CHECKED));
+	fprintf(fp, "EXIT_OMNI::%d\n", puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_OMNI_CB), PUA_CHECKBOX_CHECKED));
+	fprintf(fp, "EXIT_GRID_CLAN::%d\n", puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_GRID_CLAN_CB), PUA_CHECKBOX_CHECKED));
+	fprintf(fp, "EXIT_GRID_NEUTRAL::%d\n", puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_GRID_NEUTRAL_CB), PUA_CHECKBOX_CHECKED));
+	fprintf(fp, "EXIT_GRID_OMNI::%d\n", puGetAttribute(puGetObjectFromCollection(g_pCol, CS_EXITS_GRID_OMNI_CB), PUA_CHECKBOX_CHECKED));
+	fprintf(fp, "EXIT_RADIUS::%d\n", g_ExitProximityRadius);
+	fprintf(fp, "EXIT_ALERT::%d\n", puGetAttribute(puGetObjectFromCollection(g_pCol, CS_ALERTEXIT_CB), PUA_CHECKBOX_CHECKED));
+	fprintf(fp, "EXIT_HIGHLIGHT::%d\n", puGetAttribute(puGetObjectFromCollection(g_pCol, CS_HIGHLIGHTEXIT_CB), PUA_CHECKBOX_CHECKED));
+	
     fprintf( fp, "ITEMVALUE::%u::%u::%u::%u\n",
              puGetAttribute( puGetObjectFromCollection( g_pCol, CS_ITEMVALUE_SINGLE ), PUA_TEXTENTRY_VALUE ),
              puGetAttribute( puGetObjectFromCollection( g_pCol, CS_ITEMVALUE_TOTAL ), PUA_TEXTENTRY_VALUE ),
